@@ -1,0 +1,3233 @@
+---
+title: "COMM3501 A4 Final Script"
+author: "Minh Khanh Tang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+---
+
+# 1. Setup — Packages and Libraries
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "readr", "dplyr", "tidyr", "ggplot2", "janitor", "skimr",
+  "naniar", "forcats", "knitr", "stringr", "purrr",
+  "caret", "corrplot", "ggcorrplot", "patchwork",
+  "rpart", "rpart.plot", "randomForest", "pROC", "car", "PRROC",
+  "xgboost", "tibble", "Boruta", "kableExtra", "DALEX"
+)
+
+missing_packages <- required_packages[!required_packages %in% rownames(installed.packages())]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+# ── All libraries used anywhere in this script, loaded once here ─────────────
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(janitor)
+library(skimr)
+library(naniar)
+library(forcats)
+library(knitr)
+library(stringr)
+library(purrr)
+library(caret)
+library(corrplot)
+library(ggcorrplot)
+library(patchwork)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(pROC)
+library(car)
+library(PRROC)
+library(xgboost)
+library(tibble)
+library(Boruta)
+library(kableExtra)
+library(DALEX)
+
+options(dplyr.summarise.inform = FALSE)
+```
+
+# 2. Training Data — Load and Inspect
+
+## 2.1 Load Data
+
+```{r load-data}
+data_path <- "training_data.csv"
+raw_data <- read_csv(data_path, show_col_types = FALSE, na = c("", "NA", "N/A", "NULL", "null"))
+
+# Make column names consistent and R-friendly.
+raw_data <- raw_data %>% clean_names()
+```
+
+## 2.2 Structure and Summary
+
+```{r summary}
+str(raw_data)
+
+summary(raw_data)
+```
+
+## 2.3 Duplicate Checks
+
+```{r duplicates-full}
+duplicate_rows <- raw_data %>%
+  get_dupes()
+
+nrow(duplicate_rows)
+
+raw_data %>%
+  count(customer_id) %>%
+  filter(n > 1)
+```
+
+# 3. Training Data — Cleaning
+
+## 3.1 Yes/No to Binary Conversion
+
+```{r yes no conversion}
+yes_no_cols <- raw_data %>%
+  select(where(is.character)) %>%
+  select(where(~ all(na.omit(.) %in% c("Yes", "No")))) %>%
+  names()
+
+
+raw_data <- raw_data %>%
+  mutate(across(all_of(yes_no_cols), ~ ifelse(. == "Yes", 1, 0)))
+```
+
+## 3.2 Categorical Variables to Factors
+
+```{r factor-conversion}
+# Convert ID to character
+raw_data$customer_id <- as.character(raw_data$customer_id)
+
+# Convert all character columns to factor
+raw_data <- raw_data %>%
+  mutate(across(where(is.character), as.factor))
+
+# Make ordinal ones ordered
+raw_data <- raw_data %>%
+  mutate(
+    income_group  = factor(income_group,  ordered = TRUE),
+    credit_rating = factor(credit_rating, ordered = TRUE)
+  )
+
+# Convert binary 0/1 variables to factor
+
+binary_vars <- c(
+  "handset_refurbished",
+  "handset_web_capable",
+  "has_credit_card",
+  "owns_computer",
+  "owns_motorcycle",
+  "truck_owner",
+  "rv_owner",
+  "buys_via_mail_order",
+  "responds_to_mail_offers",
+  "opt_out_mailings",
+  "children_in_hh",
+  "made_call_to_retention_team"
+)
+
+raw_data <- raw_data %>%
+  mutate(across(
+    all_of(binary_vars),
+    ~ factor(., levels = c(0, 1))
+  ))
+
+# Convert churn to factor
+raw_data <- raw_data %>%
+  mutate(churn = factor(churn, levels = c(0, 1)))
+
+# Verify structure
+str(raw_data)
+```
+
+## 3.3 Missing Values — Investigation
+
+```{r missing-counts}
+missing_summary <- raw_data %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "missing_count") %>%
+  mutate(
+    missing_percent = round(100 * missing_count / nrow(raw_data), 2)
+  ) 
+
+missing_summary %>%
+  filter(missing_count > 0) %>%
+  kable()
+
+# ── Investigate missing value overlap ─────────────────────────────────────────
+
+usage_missing_vars <- c(
+  "monthly_revenue", "monthly_minutes", "total_recurring_charge",
+  "overage_minutes", "roaming_calls"
+)
+
+# Are the 91 missing rows the same rows across all five variables?
+usage_missing_rows <- raw_data %>%
+  filter(if_any(all_of(usage_missing_vars), is.na))
+
+nrow(usage_missing_rows)  # expect 91 if fully overlapping
+
+# Confirm all five are missing on the same rows
+usage_missing_rows %>%
+  select(all_of(usage_missing_vars)) %>%
+  summarise(across(everything(), ~sum(is.na(.))))
+
+# Same check for age
+age_missing_rows <- raw_data %>%
+  filter(is.na(age_hh1) | is.na(age_hh2))
+
+nrow(age_missing_rows)  # expect 520
+
+age_missing_rows %>%
+  summarise(
+    missing_hh1 = sum(is.na(age_hh1)),
+    missing_hh2 = sum(is.na(age_hh2))
+  )
+
+# Do the two groups overlap?
+overlap <- raw_data %>%
+  filter(
+    if_any(all_of(usage_missing_vars), is.na) &
+    (is.na(age_hh1) | is.na(age_hh2))
+  )
+
+nrow(overlap)
+
+# Profile the missing rows — do they share characteristics?
+raw_data %>%
+  mutate(usage_missing = if_any(all_of(usage_missing_vars), is.na)) %>%
+  group_by(usage_missing) %>%
+  summarise(
+    churn_rate    = mean(churn == 1, na.rm = TRUE),
+    avg_tenure    = mean(months_in_service, na.rm = TRUE),
+    n             = n()
+  )
+
+raw_data %>%
+  mutate(age_missing = as.integer(is.na(age_hh1))) %>%
+  group_by(age_missing) %>%
+  summarise(
+    churn_rate = mean(churn == 1, na.rm = TRUE),
+    avg_tenure  = mean(months_in_service, na.rm = TRUE),
+    n           = n()
+  )
+```
+
+## 3.4 Missing Values — Treatment
+
+```{r histograms}
+raw_data %>%
+  select(
+    monthly_revenue,
+    monthly_minutes,
+    total_recurring_charge,
+    overage_minutes,
+    roaming_calls,
+    age_hh1,
+    age_hh2
+  ) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  theme_minimal()
+
+# ── Flag rows imputed due to batch data capture failure ───────────────────────
+# These 91 rows had all five usage/revenue variables missing simultaneously.
+
+raw_data <- raw_data %>%
+  mutate(
+    usage_data_imputed = as.integer(
+      is.na(monthly_revenue) &
+      is.na(monthly_minutes) &
+      is.na(total_recurring_charge) &
+      is.na(overage_minutes) &
+      is.na(roaming_calls)
+    )
+  )
+
+table(raw_data$usage_data_imputed)
+```
+
+## 3.5 Invalid and Suspicious Data Checks
+
+```{r define-columns}
+
+# Numeric columns that should not contain negative values
+non_negative_cols <- raw_data %>%
+  select(where(is.numeric)) %>%
+  names()
+
+negative_records <- raw_data %>%
+  filter(if_any(all_of(non_negative_cols), ~ . < 0))
+
+negative_records 
+
+# ---- 2. Convert negative records to NA ----
+raw_data <- raw_data %>%
+  mutate(
+    total_recurring_charge = ifelse(total_recurring_charge < 0, NA, total_recurring_charge),
+    monthly_revenue = ifelse(monthly_revenue < 0, NA, monthly_revenue)
+  )
+```
+
+```{r inconsistent-checks}
+# 1. Active subs but 0 months in service
+check_1 <- raw_data %>%
+  filter(active_subs > 0 & months_in_service == 0)
+
+check_1
+
+
+# 2. Active subs but 0 monthly revenue
+check_2 <- raw_data %>%
+  filter(active_subs > 0 & monthly_revenue == 0)
+check_2
+
+raw_data <- raw_data %>%
+  mutate(
+    zero_revenue_active = as.integer(
+      active_subs > 0 & monthly_revenue == 0
+    )
+  )
+
+# 3. 0 handsets but non-zero equipment days
+check_3 <- raw_data %>%
+  filter(handsets == 0 & current_equipment_days > 0)
+
+check_3 
+```
+
+## 3.6 Age Columns — Zero Values and Flags
+
+```{r age-checks}
+age_cols <- intersect(c("age_hh1", "age_hh2"), names(raw_data))
+
+age_checks <- map_dfr(age_cols, function(col) {
+  tibble(
+    column = col,
+    age_zero_count = sum(raw_data[[col]] == 0, na.rm = TRUE),
+    age_below_18_count = sum(raw_data[[col]] > 0 & raw_data[[col]] < 18, na.rm = TRUE),
+    age_above_100_count = sum(raw_data[[col]] > 100, na.rm = TRUE),
+  )
+})
+
+age_checks %>% kable()
+
+age_zero_rows <- raw_data %>%
+  filter(if_any(all_of(age_cols), ~ . == 0)) %>%
+  nrow()
+age_zero_rows %>% kable()
+
+# Age flags and cleaning
+
+raw_data <- raw_data %>%
+  mutate(
+    # Flag rows where BOTH ages are zero — household composition unknown
+    age_unknown = as.integer(
+      (is.na(age_hh1) | age_hh1 == 0) &
+      (is.na(age_hh2) | age_hh2 == 0)
+    ),
+
+    # household_has_two_adults: only 1 where hh2 is valid and hh1 is also valid
+    # If age_unknown = 1, we cannot confirm any adults — defaults to 0
+    household_has_two_adults = as.integer(
+      !is.na(age_hh2) & age_hh2 != 0 &
+      !is.na(age_hh1) & age_hh1 != 0
+    ),
+
+    # Convert all zero ages to NA so median imputation handles them uniformly
+    age_hh1 = ifelse(age_hh1 == 0, NA, age_hh1),
+    age_hh2 = ifelse(age_hh2 == 0, NA, age_hh2)
+  )
+
+# Verify
+table(raw_data$age_unknown, useNA = "ifany")
+table(raw_data$household_has_two_adults, useNA = "ifany")
+
+# Confirm the two flags are consistent
+raw_data %>%
+  count(age_unknown, household_has_two_adults)
+
+raw_data %>%
+  filter((is.na(age_hh1) | age_hh1 == 0) & (!is.na(age_hh2) & age_hh2 != 0)) %>%
+  nrow() #there is no cases where age hh2 has a value and age hh1 = 0 --> age hh1 is the primary age variable
+
+# Convert all flags to factors
+
+flag_vars <- c(
+  "household_has_two_adults",
+  "age_unknown",
+  "usage_data_imputed",
+  "zero_revenue_active"
+)
+
+raw_data <- raw_data %>%
+  mutate(across(
+    all_of(flag_vars),
+    ~ factor(., levels = c(0, 1))
+  ))
+
+# Verify
+raw_data %>%
+  select(all_of(flag_vars)) %>%
+  str()
+```
+
+# 4. Train/Test Split
+```{r}
+set.seed(31)
+
+train_index <- createDataPartition(raw_data$churn, p = 0.7, list = FALSE)
+train_raw   <- raw_data[ train_index, ]
+test_raw    <- raw_data[-train_index, ]
+
+# Confirm churn balance preserved
+prop.table(table(train_raw$churn))
+prop.table(table(test_raw$churn))
+```
+
+# 5. Imputation (Training-Derived Statistics)
+```{r imputation}
+
+# ── Compute imputation statistics from training set only ──────────────────────
+
+num_cols <- c(
+  "monthly_revenue", "monthly_minutes", "total_recurring_charge",
+  "overage_minutes", "roaming_calls", "current_equipment_days",
+  "age_hh1", "handsets"
+)
+
+num_cols <- intersect(num_cols, names(train_raw))
+
+train_medians <- train_raw %>%
+  summarise(across(all_of(num_cols), ~ median(., na.rm = TRUE)))
+
+train_mode_service <- train_raw$service_area %>%
+  na.omit() %>%
+  table() %>%
+  sort(decreasing = TRUE) %>%
+  names() %>%
+  .[1]
+
+# Display numeric imputation values (medians) used from training set
+train_medians_display <- train_medians %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "median_imputed_value")
+
+print(train_medians_display)
+
+# Display categorical imputation value (mode) for service_area
+cat("Mode imputed for service_area:", train_mode_service, "\n")
+
+impute_df <- function(df, medians, mode_sa) {
+  df %>%
+    mutate(
+      total_recurring_charge = ifelse(
+        total_recurring_charge < 0, NA, total_recurring_charge
+      ),
+      across(
+        all_of(names(medians)),
+        ~ ifelse(is.na(.), medians[[cur_column()]], .)
+      ),
+      # Convert to character first to avoid factor integer coercion
+      service_area = as.character(service_area),
+      service_area = ifelse(is.na(service_area), mode_sa, service_area),
+      service_area = as.factor(service_area)
+    )
+}
+
+train_data <- impute_df(train_raw, train_medians, train_mode_service)
+test_data  <- impute_df(test_raw,  train_medians, train_mode_service)
+
+train_data$age_hh2 <-NULL
+test_data$age_hh2 <- NULL
+# Verify all — numeric and service_area
+train_data %>%
+  select(all_of(num_cols), service_area) %>%
+  summarise(across(everything(), ~ sum(is.na(.))))
+
+test_data %>%
+  select(all_of(num_cols), service_area) %>%
+  summarise(across(everything(), ~ sum(is.na(.))))
+```
+
+# 6. Feature Engineering
+```{r}
+
+# ── Feature engineering — applied to both sets via function ───────────────────
+
+engineer_features <- function(df) {
+  df %>%
+    mutate(
+      # Call quality
+      total_call_issues = dropped_calls + blocked_calls + unanswered_calls,
+      call_issue_rate   = ifelse(
+        monthly_minutes > 0,
+        total_call_issues / monthly_minutes,
+        NA_real_
+      ),
+
+      # Usage efficiency
+      revenue_per_minute = ifelse(
+        monthly_minutes > 0,
+        monthly_revenue / monthly_minutes,
+        NA_real_
+      ),
+      overage_rate = ifelse(
+        monthly_minutes > 0,
+        overage_minutes / monthly_minutes,
+        NA_real_
+      ),
+
+      # Equipment
+      equipment_age_relative_to_tenure = ifelse(
+        months_in_service > 0,
+        current_equipment_days / (months_in_service * 30),
+        NA_real_
+      ),
+
+      # Tenure and usage groupings (EDA reference only)
+      tenure_group = cut(
+        months_in_service,
+        breaks        = c(0, 12, 24, 36, Inf),
+        labels        = c("0-12", "13-24", "25-36", "36+"),
+        include.lowest = TRUE
+      ),
+      usage_level = factor(
+        case_when(
+          monthly_minutes < 300 ~ "Low",
+          monthly_minutes < 800 ~ "Medium",
+          TRUE                  ~ "High"
+        ),
+        levels  = c("Low", "Medium", "High"),
+        ordered = TRUE
+      ),
+
+      # Service area decomposition
+      service_area  = as.character(service_area),
+      sa_market     = as.factor(substr(service_area, 1, 3)),
+      sa_locality   = as.factor(substr(service_area, 4, 6)),
+      sa_area_code  = as.factor(substr(service_area, 7, 9))
+    )
+}
+
+train_data <- engineer_features(train_data)
+test_data  <- engineer_features(test_data)
+
+# Sanity check
+glimpse(train_data)
+glimpse(test_data)
+```
+
+## 6.1 Correlation Heatmaps and Multicollinearity Removal
+
+```{r correlation-heatmaps}
+
+# Define groups
+usage_vars <- c(
+  "monthly_minutes", "overage_minutes", "roaming_calls",
+  "dropped_calls", "blocked_calls", "unanswered_calls",
+  "customer_care_calls", "threeway_calls",
+  "outbound_calls", "inbound_calls",
+  "dropped_blocked_calls",
+  "call_forwarding_calls", "call_waiting_calls"
+)
+
+retention_vars <- c(
+  "retention_calls",
+  "retention_offers_accepted",
+  "made_call_to_retention_team"
+)
+
+revenue_vars <- c(
+  "monthly_revenue",
+  "total_recurring_charge"
+)
+
+engineered_vars <- c(
+  "total_call_issues",
+  "call_issue_rate",
+  "overage_rate",
+  "revenue_per_minute",
+  "monthly_minutes", "overage_minutes",
+  "dropped_calls", "blocked_calls", "unanswered_calls",
+  "monthly_revenue"
+)
+
+# Function to plot heatmap
+plot_corr <- function(vars, title) {
+  vars <- intersect(vars, names(train_data))
+  
+  if (length(vars) > 1) {
+    # Convert factors to numeric for correlation only
+    cor_data <- train_data %>%
+      select(all_of(vars)) %>%
+      mutate(across(where(is.factor), ~ as.numeric(.) - 1))
+    
+    cor_mat <- cor(cor_data, use = "complete.obs")
+    
+    corrplot(
+      cor_mat,
+      method      = "color",
+      type        = "upper",
+      addCoef.col = "black",
+      tl.cex      = 0.8,
+      number.cex  = 0.7,
+      title       = title,
+      mar         = c(0, 0, 1, 0)
+    )
+  }
+}
+
+# Plot each group
+plot_corr(usage_vars,     "Usage Variables")
+plot_corr(retention_vars, "Retention Variables")
+plot_corr(revenue_vars,   "Revenue Variables")
+plot_corr(engineered_vars,   "Engineered Variables")
+
+#install.packages("ggcorrplot")
+
+# ── Define variable groups ─────────────────────────────────────────────────
+usage_vars <- c(
+  "monthly_minutes", "overage_minutes", "roaming_calls",
+  "dropped_calls", "blocked_calls", "unanswered_calls",
+  "customer_care_calls", "threeway_calls",
+  "outbound_calls", "inbound_calls",
+  "dropped_blocked_calls",
+  "call_forwarding_calls", "call_waiting_calls"
+)
+
+retention_vars <- c(
+  "retention_calls",
+  "retention_offers_accepted",
+  "made_call_to_retention_team"
+)
+
+revenue_vars <- c(
+  "monthly_revenue",
+  "total_recurring_charge"
+)
+
+engineered_vars <- c(
+  "total_call_issues",
+  "call_issue_rate",
+  "overage_rate",
+  "revenue_per_minute",
+  "monthly_minutes", "overage_minutes",
+  "dropped_calls", "blocked_calls", "unanswered_calls",
+  "monthly_revenue"
+)
+
+# ── Clean display labels (snake_case -> Title Case) ─────────────────────────
+clean_labels <- function(vars) {
+  vars %>%
+    str_replace_all("_", " ") %>%
+    str_to_title()
+}
+
+# ── Function to build a correlation plot (ggcorrplot, report-styled) ────────
+plot_corr <- function(vars, title) {
+  vars <- intersect(vars, names(train_data))
+  if (length(vars) < 2) return(NULL)
+
+  cor_data <- train_data %>%
+    select(all_of(vars)) %>%
+    mutate(across(where(is.factor), ~ as.numeric(.) - 1))
+
+  cor_mat <- cor(cor_data, use = "complete.obs")
+  colnames(cor_mat) <- rownames(cor_mat) <- clean_labels(colnames(cor_mat))
+
+  ggcorrplot(
+    cor_mat,
+    type       = "upper",
+    lab        = TRUE,
+    lab_size   = 3,
+    hc.order   = TRUE,             # hierarchical clustering: groups correlated vars together
+    outline.col = "white",
+    colors     = c("#1f3864", "white", "#c8860d"),  # navy - white - gold, matches report palette
+    title      = title,
+    ggtheme    = theme_minimal(base_size = 10)
+  ) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 12, hjust = 0),
+      axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+      axis.text.y     = element_text(size = 8),
+      legend.position = "right",
+      legend.title    = element_blank(),
+      panel.grid      = element_blank()
+    )
+}
+
+# ── Generate each panel ──────────────────────────────────────────────────────
+p_usage      <- plot_corr(usage_vars,      "Usage Variables")
+p_retention  <- plot_corr(retention_vars,  "Retention Variables")
+p_revenue    <- plot_corr(revenue_vars,    "Revenue Variables")
+p_engineered <- plot_corr(engineered_vars, "Engineered Variables")
+
+# ── Display individually ─────────────────────────────────────────────────────
+p_usage
+p_retention
+p_revenue
+p_engineered
+
+# ── OR combine into a single 2x2 grid for a compact appendix figure ─────────
+(p_usage + p_retention) / (p_revenue + p_engineered) +
+  plot_annotation(title = "Correlation Structure by Variable Group",
+                   theme = theme(plot.title = element_text(face = "bold", size = 14)))
+
+# ── Save high-resolution version for appendix ────────────────────────────────
+ggsave("correlation_heatmaps.png", width = 12, height = 10, dpi = 300)
+
+# Delete multicollinearity-risk variables
+train_data$made_call_to_retention_team <- NULL
+train_data$dropped_blocked_calls <- NULL
+test_data$made_call_to_retention_team <- NULL
+test_data$dropped_blocked_calls <- NULL
+```
+
+## 6.2 Log Transformation
+```{r}
+# ── Histogram matrix — all numeric variables ──────────────────────────────────
+
+train_data %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Distribution of Numeric Variables",
+       x = NULL, y = "Count") +
+  theme_minimal()
+
+# ── Log transformation — all numeric variables ────────────────────────────────
+
+numeric_vars <- train_data %>%
+  select(where(is.numeric)) %>%
+  names()
+
+log_transform <- function(df) {
+  df %>%
+    mutate(across(
+      all_of(numeric_vars),
+      ~ log1p(.),
+      .names = "log_{.col}"   
+    ))
+}
+
+train_data <- log_transform(train_data)
+test_data <- log_transform(test_data)
+
+# Verify new columns created
+train_data %>%
+  select(starts_with("log_")) %>%
+  names()
+
+# Histogram matrix of log columns
+train_data %>%
+  select(starts_with("log_")) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "darkgreen", colour = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Distribution After Log Transformation",
+       x = NULL, y = "Count") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 7))
+```
+
+# 7. Build Modelling Datasets
+
+SA-market churn-rate binning and the model-ready `train_model` / `test_model` data frames used by every model in Section 10.
+```{r}
+
+set.seed(31)
+
+# ── SA market binning — computed from training set only ───────────────────────
+
+market_rates <- train_data %>%
+  group_by(sa_market) %>%
+  summarise(
+    churn_rate = mean(as.numeric(as.character(churn)), na.rm = TRUE),
+    n          = n(),
+    .groups    = "drop"
+  ) %>%
+  filter(n >= 30)
+
+# Check spread
+summary(market_rates$churn_rate)
+
+# Tertile breaks — guarantees all 3 levels
+tertile_breaks <- quantile(market_rates$churn_rate, probs = c(0, 1/3, 2/3, 1))
+cat("Tertile breaks:", tertile_breaks, "\n")
+
+market_bins <- market_rates %>%
+  mutate(
+    sa_market_group = case_when(
+      churn_rate >= tertile_breaks[3] ~ "High",
+      churn_rate >= tertile_breaks[2] ~ "Medium",
+      TRUE                            ~ "Low"
+    ),
+    sa_market_group = factor(sa_market_group, levels = c("Low", "Medium", "High"))
+  ) %>%
+  select(sa_market, sa_market_group)
+
+# Verify all three levels present
+table(market_bins$sa_market_group)
+
+# ── 2. Build modelling datasets — all variables except explicitly excluded ─────
+
+exclude_vars <- c(
+  # Geography — replaced by sa_market_group
+  "sa_market",
+  "sa_locality",
+  "sa_area_code",
+  "service_area",
+
+  # EDA only groupings
+  "tenure_group",
+  "usage_level",
+
+  # Identifier/Not useful flags
+  "customer_id",
+  "usage_data_imputed",
+  "zero_revenue_active",
+  "household_has_two_adults",
+  
+  #Multicollinearity
+  "total_call_issues",
+  "log_total_call_issues",
+
+  # Raw numeric variables — replaced by log_ versions for LR
+  "months_in_service",
+  "equipment_age_relative_to_tenure",
+  "retention_calls",
+  "retention_offers_accepted",
+  "inbound_calls",
+  "outbound_calls",
+  "call_waiting_calls",
+  "total_call_issues",
+  "monthly_revenue",
+  "monthly_minutes",
+  "total_recurring_charge",
+  "age_hh1",
+  "overage_minutes",
+  "roaming_calls",
+  "current_equipment_days",
+  "handsets",
+  "dropped_calls",
+  "blocked_calls",
+  "unanswered_calls",
+  "customer_care_calls",
+  "threeway_calls",
+  "call_forwarding_calls",
+  "active_subs",
+  "call_issue_rate",
+  "overage_rate",
+  "revenue_per_minute"
+)
+
+prepare_model_data <- function(df) {
+  df %>%
+    left_join(market_bins, by = "sa_market") %>%
+    mutate(churn = factor(
+      ifelse(churn == "Yes" | churn == 1, "Yes", "No"),
+      levels = c("No", "Yes")
+    )) %>%
+    select(-all_of(exclude_vars)) %>%
+    drop_na() %>%
+    droplevels()
+}
+
+train_model <- prepare_model_data(train_data)
+test_model  <- prepare_model_data(test_data)
+
+# Confirm variables going into model
+cat("Variables in model:\n")
+print(setdiff(names(train_model), "churn"))
+
+cat("\nDimensions — train:", dim(train_model), "\n")
+cat("Dimensions — test: ", dim(test_model),  "\n")
+prop.table(table(train_model$churn))
+
+# No CV control
+ctrl_none <- trainControl(method = "none", classProbs = TRUE)
+```
+
+
+# 8. Evaluation Data — Load, Clean, and Prepare
+
+## 8.1 Load the Evaluation Data
+
+```{r load-eval}
+eval_path <- "eval_data.csv"
+eval_raw <- read_csv(eval_path, show_col_types = FALSE,
+                      na = c("", "NA", "N/A", "NULL", "null"))
+
+eval_raw <- eval_raw %>% clean_names()
+
+dim(eval_raw)
+str(eval_raw)
+```
+
+## 8.2 Structure and Summary
+
+```{r summary-eval}
+summary(eval_raw)
+```
+
+## 8.3 Duplicate Checks
+
+```{r duplicates-eval}
+eval_raw %>% get_dupes() %>% nrow()
+
+eval_raw %>%
+  count(customer_id) %>%
+  filter(n > 1)
+```
+
+## 8.4 Yes/No Conversion
+
+```{r yes-no-eval}
+yes_no_cols_eval <- setdiff(yes_no_cols, "churn")
+eval_raw <- eval_raw %>%
+  mutate(across(all_of(yes_no_cols_eval), ~ ifelse(. == "Yes", 1, 0)))
+```
+
+## 8.5 Categorical Variables to Factors
+
+```{r factor-conversion-eval}
+eval_raw$customer_id <- as.character(eval_raw$customer_id)
+
+eval_raw <- eval_raw %>%
+  mutate(across(where(is.character), as.factor))
+
+eval_raw <- eval_raw %>%
+  mutate(
+    income_group  = factor(income_group,  ordered = TRUE),
+    credit_rating = factor(credit_rating, ordered = TRUE)
+  )
+
+eval_raw <- eval_raw %>%
+  mutate(across(all_of(binary_vars), ~ factor(., levels = c(0, 1))))
+
+str(eval_raw)
+```
+
+```{r check-unseen-levels}
+# Reuses raw_data (training, already cleaned/factored above) — no need to
+# re-read training_data.csv from disk a second time.
+
+cat_cols_to_check <- c("occupation", "marital_status", "prizm_code", "service_area")
+
+unseen_levels <- map_dfr(cat_cols_to_check, function(col) {
+  train_levels <- unique(na.omit(as.character(raw_data[[col]])))
+  eval_levels  <- unique(na.omit(as.character(eval_raw[[col]])))
+  new_levels   <- setdiff(eval_levels, train_levels)
+  tibble(
+    column      = col,
+    n_new_levels = length(new_levels),
+    new_levels   = paste(head(new_levels, 10), collapse = ", ")
+  )
+})
+
+print(unseen_levels)
+cat("\nIf n_new_levels > 0 anywhere above, resolve before modelling.\n")
+```
+
+## 8.6 Missing Values and Usage-Block Flag
+
+```{r missing-counts-eval}
+missing_summary_eval <- eval_raw %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "missing_count") %>%
+  mutate(missing_percent = round(100 * missing_count / nrow(eval_raw), 2))
+
+missing_summary_eval %>% filter(missing_count > 0) %>% kable()
+```
+
+```{r}
+usage_missing_vars <- c(
+  "monthly_revenue", "monthly_minutes", "total_recurring_charge",
+  "overage_minutes", "roaming_calls", "age_hh1", "age_hh2"
+)
+
+eval_raw <- eval_raw %>%
+  mutate(
+    usage_data_imputed = as.integer(
+      is.na(monthly_revenue) &
+      is.na(monthly_minutes) &
+      is.na(total_recurring_charge) &
+      is.na(overage_minutes) &
+      is.na(roaming_calls)
+    )
+  )
+
+table(eval_raw$usage_data_imputed, useNA = "ifany")
+```
+
+## 8.7 Invalid and Suspicious Data Checks
+
+```{r negative-values-eval}
+non_negative_cols <- eval_raw %>%
+  select(where(is.numeric)) %>%
+  names()
+
+eval_raw %>%
+  filter(if_any(all_of(non_negative_cols), ~ . < 0))
+
+eval_raw <- eval_raw %>%
+  mutate(
+    total_recurring_charge = ifelse(total_recurring_charge < 0, NA, total_recurring_charge),
+    monthly_revenue = ifelse(monthly_revenue < 0, NA, monthly_revenue)
+  )
+```
+
+```{r inconsistent-checks-eval}
+eval_raw %>% filter(active_subs > 0 & months_in_service == 0)
+
+eval_raw %>% filter(active_subs > 0 & monthly_revenue == 0)
+
+eval_raw <- eval_raw %>%
+  mutate(
+    zero_revenue_active = as.integer(active_subs > 0 & monthly_revenue == 0)
+  )
+
+eval_raw %>% filter(handsets == 0 & current_equipment_days > 0)
+```
+
+## 8.8 Age Columns — Zero Values and Flags
+
+```{r age-checks-eval}
+age_cols <- intersect(c("age_hh1", "age_hh2"), names(eval_raw))
+
+age_checks_eval <- map_dfr(age_cols, function(col) {
+  tibble(
+    column = col,
+    age_zero_count = sum(eval_raw[[col]] == 0, na.rm = TRUE),
+    age_below_18_count = sum(eval_raw[[col]] > 0 & eval_raw[[col]] < 18, na.rm = TRUE),
+    age_above_100_count = sum(eval_raw[[col]] > 100, na.rm = TRUE)
+  )
+})
+
+age_checks_eval %>% kable()
+
+age_zero_rows_eval <- eval_raw %>%
+  filter(if_any(all_of(age_cols), ~ . == 0)) %>%
+  nrow()
+age_zero_rows_eval %>% kable()
+
+eval_raw <- eval_raw %>%
+  mutate(
+    age_unknown = as.integer(
+      (is.na(age_hh1) | age_hh1 == 0) &
+      (is.na(age_hh2) | age_hh2 == 0)
+  ))
+#No age data is 0, no need ton convert to NA
+#No age data is 0, no need for household_has_two_adults flag (flag is also not used in modelling)
+
+table(eval_raw$age_unknown, useNA = "ifany")
+
+flag_vars <- c("age_unknown","zero_revenue_active", "usage_data_imputed")
+
+eval_raw <- eval_raw %>%
+  mutate(across(all_of(flag_vars), ~ factor(., levels = c(0, 1))))
+```
+
+## 8.9 Impute Evaluation Data (Training-Derived Statistics)
+
+```{r impute-eval}
+# Reuses impute_df(), train_medians, train_mode_service, and num_cols —
+# all already defined in the training "Imputation" section above.
+
+print(train_medians)
+cat("Training mode service_area:", train_mode_service, "\n")
+
+eval_data <- impute_df(eval_raw, train_medians, train_mode_service)
+eval_data$age_hh2 <- NULL
+
+# Verify
+eval_data %>%
+  select(all_of(num_cols), service_area) %>%
+  summarise(across(everything(), ~ sum(is.na(.))))
+```
+
+## 8.10 Feature Engineering (Identical Function to Training)
+
+```{r feature-engineering-eval}
+# Reuses engineer_features() from the training section above — this also
+# creates tenure_group/usage_level on eval_data, which is fine: they're
+# EDA-only groupings and are already in exclude_vars, so they never reach
+# eval_model.
+
+eval_data <- engineer_features(eval_data)
+eval_data$dropped_blocked_calls <- NULL
+eval_data$made_call_to_retention_team <- NULL
+glimpse(eval_data)
+```
+
+## 8.11 Log Transformation
+
+```{r log-transform-eval}
+
+eval_data <- log_transform(eval_data)
+
+eval_data %>% select(starts_with("log_")) %>% names()
+```
+
+## 8.12 SA Market Group (Churn-Rate Tertile Bins from Training)
+
+```{r sa-market-group-eval}
+# Reuses `market_bins`, already built in the training "Modelling" section
+# above (filter(n >= 30), tertile breaks computed from train_data). Do NOT
+# recompute market_rates/tertile_breaks/market_bins here.
+
+eval_data <- eval_data %>%
+  left_join(market_bins, by = "sa_market")
+
+n_unmapped <- sum(is.na(eval_data$sa_market_group))
+cat("Eval customers with an sa_market not seen in training (n >= 30 rule):", n_unmapped, "\n")
+
+eval_data <- eval_data %>%
+  mutate(sa_market_group = fct_na_value_to_level(sa_market_group, level = "Medium"))
+
+table(eval_data$sa_market_group, useNA = "ifany")
+```
+
+## 8.13 Build the Model-Ready Evaluation Dataset (eval_model)
+
+```{r prepare-eval-model}
+# This mirrors training's exclude_vars, with one deliberate difference:
+# "household_has_two_adults" is NOT included here, because eval_data never
+# computes that flag. tenure_group and usage_level ARE included here now
+# that engineer_features() is reused from training and creates them on
+# eval_data too.
+
+exclude_vars <- c(
+  # Geography — replaced by sa_market_group
+  "sa_market",
+  "sa_locality",
+  "sa_area_code",
+  "service_area",
+
+  # EDA only groupings
+  "tenure_group",
+  "usage_level",
+
+  # Identifier/Not useful flags
+  "customer_id",
+  "usage_data_imputed",
+  "zero_revenue_active",
+
+  #Multicollinearity
+  "total_call_issues",
+  "log_total_call_issues",
+
+  # Raw numeric variables — replaced by log_ versions for LR
+  "months_in_service",
+  "equipment_age_relative_to_tenure",
+  "retention_calls",
+  "retention_offers_accepted",
+  "inbound_calls",
+  "outbound_calls",
+  "call_waiting_calls",
+  "total_call_issues",
+  "monthly_revenue",
+  "monthly_minutes",
+  "total_recurring_charge",
+  "age_hh1",
+  "overage_minutes",
+  "roaming_calls",
+  "current_equipment_days",
+  "handsets",
+  "dropped_calls",
+  "blocked_calls",
+  "unanswered_calls",
+  "customer_care_calls",
+  "threeway_calls",
+  "call_forwarding_calls",
+  "active_subs",
+  "call_issue_rate",
+  "overage_rate",
+  "revenue_per_minute"
+)
+
+# Keep customer_id aside — needed later to build selected_customers_<zID>.csv
+eval_customer_id <- eval_data$customer_id
+
+eval_model <- eval_data %>%
+  select(-all_of(exclude_vars)) %>%
+  droplevels()
+
+sum(eval_data$monthly_minutes == 0)
+
+eval_model <- eval_data %>%
+  mutate(
+    log_call_issue_rate   = ifelse(is.na(log_call_issue_rate),   0, log_call_issue_rate),
+    log_revenue_per_minute = ifelse(is.na(log_revenue_per_minute), 0, log_revenue_per_minute),
+    log_overage_rate       = ifelse(is.na(log_overage_rate),       0, log_overage_rate)
+  )
+
+cat("Rows going into prediction:", nrow(eval_model), "(should be 10,000)\n")
+cat("Any remaining NA cells by column:\n")
+eval_model %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_na") %>%
+  filter(n_na > 0) %>%
+  print()
+
+cat("\nVariables going into eval_model:\n")
+print(names(eval_model))
+```
+
+```{r}
+factor_cols <- eval_model %>% select(where(is.factor)) %>% names()
+
+eval_model <- eval_model %>%
+  mutate(across(all_of(factor_cols), ~ factor(as.character(.), levels = levels(train_model[[cur_column()]]))))
+
+# Check how many NAs this introduces (i.e. how many genuinely unseen values existed)
+eval_model %>%
+  summarise(across(all_of(factor_cols), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything()) %>%
+  filter(value > 0)
+```
+
+# 9. Exploratory Data Analysis (Training Set)
+
+## ═════════════════════════════════════════════════════════════════════════════
+## SECTION 1: TARGET VARIABLE
+## ═════════════════════════════════════════════════════════════════════════════
+
+```{r eda-churn-distribution}
+eda_data <- train_data
+
+eda_data %>%
+  count(churn) %>%
+  mutate(
+    pct   = round(n / sum(n) * 100, 2),
+    label = paste0(ifelse(churn == 1, "Churn", "No Churn"), 
+                   "\n", n, " (", pct, "%)")
+  ) %>%
+  ggplot(aes(x = "", y = n, fill = factor(churn))) +
+  geom_col(width = 1, colour = "white") +
+  coord_polar(theta = "y") +
+  scale_fill_manual(
+    values = c("0" = "#003087", "1" = "#CC8800"),
+    labels = c("0" = "No Churn", "1" = "Churn")
+  ) +
+  geom_text(aes(label = label),
+            position = position_stack(vjust = 0.5),
+            colour   = "white", fontface = "bold", size = 4) +
+  labs(title = "Churn Distribution", fill = NULL) +
+  theme_void() +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+## ═════════════════════════════════════════════════════════════════════════════
+## SECTION 2: RETENTION & CUSTOMER CONTACT
+## ═════════════════════════════════════════════════════════════════════════════
+
+```{r eda-retention-calls}
+# Summary table
+eda_data %>%
+  group_by(churn) %>%
+  summarise(
+    avg_customer_care   = mean(customer_care_calls, na.rm = TRUE),
+    avg_retention_calls = mean(retention_calls, na.rm = TRUE)
+  )
+
+# Customer care calls
+ggplot(eda_data, aes(churn, customer_care_calls, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Customer Care Calls by Churn Status",
+       y = "Customer Care Calls") +
+  theme_minimal()
+
+# Retention calls
+ggplot(eda_data, aes(churn, retention_calls, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Retention Calls by Churn Status",
+       y = "Retention Calls") +
+  theme_minimal()
+
+```
+
+```{r eda-retention-offers}
+# Churn rate by number of retention offers accepted
+eda_data %>%
+  group_by(retention_offers_accepted, churn) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(pct = round(n / sum(n) * 100, 2))
+
+ggplot(eda_data, aes(factor(retention_offers_accepted), fill = churn)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Churn Rate by Retention Offers Accepted",
+       x = "Number of Offers Accepted", y = "Proportion") +
+  theme_minimal()
+```
+
+```{r eda-mail-offers}
+ggplot(eda_data, aes(factor(responds_to_mail_offers), fill = churn)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Churn Rate by Response to Mail Offers",
+       x = "Responds to Mail Offers (0 = No, 1 = Yes)", y = "Proportion") +
+  theme_minimal()
+
+ggplot(eda_data, aes(factor(opt_out_mailings), fill = churn)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Churn Rate by Opting Out of Mailings",
+       x = "Opted Out (0 = No, 1 = Yes)", y = "Proportion") +
+  theme_minimal()
+```
+
+## ═════════════════════════════════════════════════════════════════════════════
+## SECTION 3: TENURE & EQUIPMENT
+## ═════════════════════════════════════════════════════════════════════════════
+
+```{r eda-tenure}
+eda_data %>%
+  group_by(tenure_group) %>%
+  summarise(churn_rate = mean(churn == 1) * 100) %>%
+  ggplot(aes(x = tenure_group, y = churn_rate, fill = tenure_group)) +
+  geom_col() +
+  geom_text(aes(label = round(churn_rate, 1)), vjust = -0.5) +
+  labs(title = "Churn Rate by Tenure Group",
+       x = "Months in Service", y = "Churn Rate (%)") +
+  theme_minimal()
+```
+
+```{r eda-equipment}
+# Raw equipment days
+ggplot(eda_data, aes(churn, current_equipment_days, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Equipment Age by Churn Status",
+       y = "Current Equipment Days") +
+  theme_minimal()
+
+t.test(current_equipment_days ~ churn, data = eda_data)
+
+# Equipment age relative to tenure (engineered)
+eda_data %>%
+  filter(!is.na(equipment_age_relative_to_tenure)) %>%
+  ggplot(aes(churn, equipment_age_relative_to_tenure, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Relative Equipment Age by Churn Status",
+       y = "Equipment Days / (Months in Service × 30)") +
+  theme_minimal()
+
+# Handset type
+ggplot(eda_data, aes(factor(handset_refurbished), fill = churn)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Churn Rate by Handset Type",
+       x = "Refurbished Handset (0 = No, 1 = Yes)", y = "Proportion") +
+  theme_minimal()
+```
+
+## ═════════════════════════════════════════════════════════════════════════════
+## SECTION 4: USAGE & REVENUE
+## ═════════════════════════════════════════════════════════════════════════════
+
+```{r eda-usage-raw}
+# Summary
+eda_data %>%
+  group_by(churn) %>%
+  summarise(
+    avg_revenue  = mean(monthly_revenue, na.rm = TRUE),
+    avg_minutes  = mean(monthly_minutes, na.rm = TRUE)
+  )
+
+ggplot(eda_data, aes(churn, monthly_revenue, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Monthly Revenue by Churn Status") +
+  theme_minimal()
+
+ggplot(eda_data, aes(churn, monthly_minutes, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Monthly Minutes by Churn Status") +
+  theme_minimal()
+
+# Usage level (low/medium/high) — engineered grouping
+eda_data %>%
+  group_by(usage_level) %>%
+  summarise(churn_rate = mean(churn == 1) * 100) %>%
+  ggplot(aes(usage_level, churn_rate, fill = usage_level)) +
+  geom_col() +
+  geom_text(aes(label = round(churn_rate, 1)), vjust = -0.5) +
+  labs(title = "Churn Rate by Usage Level",
+       x = "Usage Level", y = "Churn Rate (%)") +
+  theme_minimal()
+```
+
+```{r eda-usage-engineered}
+# Revenue per minute — value efficiency
+eda_data %>%
+  filter(!is.na(revenue_per_minute)) %>%
+  ggplot(aes(churn, revenue_per_minute, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Revenue per Minute by Churn Status",
+       y = "Revenue per Minute") +
+  theme_minimal()
+
+# Overage rate — plan stress indicator
+eda_data %>%
+  filter(!is.na(overage_rate)) %>%
+  ggplot(aes(churn, overage_rate, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Overage Rate by Churn Status",
+       y = "Overage Minutes / Monthly Minutes") +
+  theme_minimal()
+```
+
+```{r eda-call-issues}
+# Raw call issues
+ggplot(eda_data, aes(churn, total_call_issues, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Total Call Issues by Churn Status",
+       y = "Dropped + Blocked + Unanswered Calls") +
+  theme_minimal()
+
+# Call issue rate — normalised by activity level
+eda_data %>%
+  filter(!is.na(call_issue_rate)) %>%
+  ggplot(aes(churn, call_issue_rate, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Call Issue Rate by Churn Status",
+       y = "Call Issues / Monthly Minutes") +
+  theme_minimal()
+```
+
+```{r eda-revenue-charge}
+ggplot(eda_data, aes(churn, total_recurring_charge, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Total Recurring Charge by Churn Status") +
+  theme_minimal()
+
+t.test(total_recurring_charge ~ churn, data = eda_data)
+
+# Churn rate by charge quintile — captures non-linear relationship
+eda_data %>%
+  mutate(trc_group = ntile(total_recurring_charge, 5)) %>%
+  group_by(trc_group) %>%
+  summarise(churn_rate = mean(churn == 1) * 100) %>%
+  ggplot(aes(trc_group, churn_rate)) +
+  geom_line() +
+  geom_point(size = 3) +
+  labs(title = "Churn Rate by Total Recurring Charge Quintile",
+       x = "Charge Quintile (1 = Lowest)", y = "Churn Rate (%)") +
+  theme_minimal()
+```
+
+```{r eda-usage-vars-quintile}
+# Non-linear churn pattern across other usage variables
+usage_vars <- c(
+  "roaming_calls", "threeway_calls",
+  "outbound_calls", "inbound_calls",
+  "call_forwarding_calls", "call_waiting_calls"
+)
+
+eda_data %>%
+  select(all_of(usage_vars), churn) %>%
+  pivot_longer(cols = all_of(usage_vars),
+               names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  mutate(group = ntile(value, 5)) %>%
+  group_by(variable, group) %>%
+  summarise(churn_rate = mean(churn == 1) * 100, .groups = "drop") %>%
+  ggplot(aes(group, churn_rate)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~variable, scales = "free_x") +
+  labs(title = "Churn Rate by Usage Variable Quintile",
+       x = "Quintile (1 = Lowest)", y = "Churn Rate (%)") +
+  theme_minimal()
+```
+
+```{r professional visualization for report}
+
+# ── Plot 1: Churn Rate by Retention Offers Accepted ──────────────────────────
+
+p1 <- eda_data %>%
+  mutate(churn_label = factor(
+    ifelse(churn == 1 | churn == "Yes", "Churn", "No Churn"),
+    levels = c("Churn", "No Churn")  
+  )) %>%
+  ggplot(aes(factor(retention_offers_accepted), fill = churn_label)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(
+    values = c( "Churn" = "#CC8800", "No Churn" = "#003087"),
+    name   = NULL
+  ) +
+  labs(
+    title = "Churn Rate by Retention Offers Accepted",
+    x     = "Number of Offers Accepted",
+    y     = "Proportion"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title      = element_text(size = 10, face = "bold", hjust = 0.5),
+    axis.title      = element_text(size = 9),
+    axis.text       = element_text(size = 8)
+  )
+
+# ── Plot 2: Churn Rate by Usage Variable Quintile ─────────────────────────────
+
+usage_vars <- c(
+  "roaming_calls", "threeway_calls",
+  "outbound_calls", "inbound_calls",
+  "call_forwarding_calls", "call_waiting_calls"
+)
+
+p2 <- eda_data %>%
+  mutate(churn_num = as.numeric(churn == 1 | churn == "Yes")) %>%
+  select(all_of(usage_vars), churn_num) %>%
+  pivot_longer(cols      = all_of(usage_vars),
+               names_to  = "variable",
+               values_to = "value") %>%
+  group_by(variable) %>%
+  mutate(group = ntile(value, 5)) %>%
+  group_by(variable, group) %>%
+  summarise(churn_rate = mean(churn_num) * 100, .groups = "drop") %>%
+  ggplot(aes(group, churn_rate)) +
+  geom_line(colour = "#003087", linewidth = 0.8) +
+  geom_point(colour = "#CC8800", size = 2.5) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+  labs(
+    title = "Churn Rate by Usage Variable Quintile",
+    x     = "Quintile (1 = Lowest)",
+    y     = "Churn Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title  = element_text(size = 10, face = "bold", hjust = 0.5),
+    axis.title  = element_text(size = 9),
+    axis.text   = element_text(size = 7),
+    strip.text  = element_text(size = 8)
+  )
+
+# ── Combine side by side ───────────────────────────────────────────────────────
+
+p1 + plot_spacer() + p2 +
+  plot_layout(widths = c(2, 0.15,2)) +
+  plot_annotation(
+    theme = theme(plot.background = element_rect(fill = "white", colour = NA))
+  )
+#----------------
+
+# ── Plot 1: Churn Rate by Tenure Group ───────────────────────────────────────
+
+p3 <- eda_data %>%
+  mutate(churn_num = as.numeric(churn == 1 | churn == "Yes")) %>%
+  group_by(tenure_group) %>%
+  summarise(churn_rate = mean(churn_num) * 100, .groups = "drop") %>%
+  ggplot(aes(x = tenure_group, y = churn_rate, fill = tenure_group)) +
+  geom_col() +
+  geom_text(aes(label = round(churn_rate, 1)), vjust = -0.5, size = 3) +
+  scale_fill_manual(
+    values = c(
+      "0-12"  = "#003087",
+      "13-24" = "#CC8800",
+      "25-36" = "#003087",
+      "36+"   = "#003087"
+    )
+  ) +
+  labs(
+    title = "Churn Rate by Tenure Group",
+    x     = "Months in Service",
+    y     = "Churn Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title      = element_text(size = 10, face = "bold", hjust = 0.5),
+    axis.title      = element_text(size = 9),
+    axis.text       = element_text(size = 8)
+  )
+
+# ── Plot 2: Top and Bottom 10 Markets by Churn Rate ───────────────────────────
+
+sa_market_churn <- eda_data %>%
+  mutate(churn_num = as.numeric(churn == 1 | churn == "Yes")) %>%
+  group_by(sa_market) %>%
+  summarise(churn_rate = mean(churn_num) * 100, n = n(), .groups = "drop") %>%
+  filter(n >= 50) %>%
+  arrange(desc(churn_rate))
+
+p4 <- bind_rows(
+  slice_head(sa_market_churn, n = 10),
+  slice_tail(sa_market_churn, n = 10)
+) %>%
+  mutate(group = rep(c("Highest Churn", "Lowest Churn"), each = 10)) %>%
+  ggplot(aes(reorder(sa_market, churn_rate), churn_rate, fill = group)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("Highest Churn" = "#CC8800", "Lowest Churn" = "#003087"),
+    name   = NULL
+  ) +
+  labs(
+    title = "Top and Bottom 10 Markets by Churn Rate",
+    x     = "Market",
+    y     = "Churn Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title      = element_text(size = 10, face = "bold", hjust = 0.5),
+    axis.title      = element_text(size = 9),
+    axis.text       = element_text(size = 7)
+  )
+
+# ── Combine side by side ──────────────────────────────────────────────────────
+
+p3 + plot_spacer() + p4 +
+  plot_layout(widths = c(2, 0.15, 2))
+```
+
+## ═════════════════════════════════════════════════════════════════════════════
+## SECTION 5: DEMOGRAPHICS
+## ═════════════════════════════════════════════════════════════════════════════
+
+```{r eda-demographics}
+# Age (primary account holder)
+ggplot(eda_data, aes(churn, age_hh1, fill = churn)) +
+  geom_boxplot() +
+  labs(title = "Primary Household Age by Churn Status",
+       y = "Age (Primary)") +
+  theme_minimal()
+
+wilcox.test(age_hh1 ~ churn, data = eda_data)
+
+# Income group
+ggplot(eda_data, aes(income_group, fill = churn)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip() +
+  labs(title = "Churn Rate by Income Group", y = "Proportion") +
+  theme_minimal()
+
+# Credit rating — counterintuitive finding expected
+eda_data %>%
+  group_by(credit_rating) %>%
+  summarise(churn_rate = mean(churn == 1) * 100, n = n()) %>%
+  ggplot(aes(credit_rating, churn_rate)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Churn Rate by Credit Rating",
+       y = "Churn Rate (%)") +
+  theme_minimal()
+
+# Occupation
+eda_data %>%
+  group_by(occupation) %>%
+  summarise(churn_rate = mean(churn == 1) * 100, n = n()) %>%
+  arrange(desc(churn_rate)) %>%
+  ggplot(aes(reorder(occupation, churn_rate), churn_rate)) +
+  geom_col(fill = "darkgreen") +
+  coord_flip() +
+  labs(title = "Churn Rate by Occupation",
+       x = "Occupation", y = "Churn Rate (%)") +
+  theme_minimal()
+
+# Prizm code (residential area type)
+eda_data %>%
+  group_by(prizm_code) %>%
+  summarise(churn_rate = mean(churn == 1) * 100, n = n()) %>%
+  ggplot(aes(reorder(prizm_code, churn_rate), churn_rate)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(churn_rate, 1)), hjust = -0.2) +
+  coord_flip() +
+  labs(title = "Churn Rate by Residential Area Type (Prizm)",
+       x = "Prizm Code", y = "Churn Rate (%)") +
+  theme_minimal()
+
+# Household composition
+eda_data %>%
+  group_by(household_has_two_adults) %>%
+  summarise(churn_rate = mean(churn == 1) * 100, n = n())
+
+ggplot(eda_data, aes(factor(household_has_two_adults), fill = churn)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Churn Rate by Household Composition",
+       x = "Two-Adult Household (0 = No, 1 = Yes)", y = "Proportion") +
+  theme_minimal()
+```
+
+## ═════════════════════════════════════════════════════════════════════════════
+## SECTION 6: GEOGRAPHY
+## ═════════════════════════════════════════════════════════════════════════════
+
+```{r eda-geography}
+# Top and bottom 10 markets by churn rate (min 50 customers for stability)
+sa_market_churn <- eda_data %>%
+  group_by(sa_market) %>%
+  summarise(churn_rate = mean(churn == 1) * 100, n = n()) %>%
+  filter(n >= 50) %>%
+  arrange(desc(churn_rate))
+
+bind_rows(
+  slice_head(sa_market_churn, n = 10),
+  slice_tail(sa_market_churn, n = 10)
+) %>%
+  mutate(group = rep(c("Highest Churn", "Lowest Churn"), each = 10)) %>%
+  ggplot(aes(reorder(sa_market, churn_rate), churn_rate, fill = group)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top and Bottom 10 Markets by Churn Rate",
+       x = "Market", y = "Churn Rate (%)") +
+  theme_minimal()
+```
+
+
+# 10. Predictive Modelling
+
+## ═════════════════════════════════════════════════════════════════════════════
+## MODEL 1: LOGISTIC REGRESSION
+## ═════════════════════════════════════════════════════════════════════════════
+
+```{r logistic-regression}
+# ── MODEL 1: LOGISTIC REGRESSION ─────────────────────────────────────────────
+
+set.seed(31)
+
+# Use glm() directly — more memory efficient than caret for large variable sets
+lr_model <- glm(
+  churn ~ .,
+  data   = train_model,
+  family = binomial()
+)
+
+# ── Coefficient summary ───────────────────────────────────────────────────────
+lr_summary <- summary(lr_model)
+print(lr_summary)
+
+# Significant predictors only
+lr_coefs <- as.data.frame(coef(lr_summary)) %>%
+  rownames_to_column("variable") %>%
+  rename(
+    estimate  = Estimate,
+    std_error = `Std. Error`,
+    z_value   = `z value`,
+    p_value   = `Pr(>|z|)`
+  ) %>%
+  mutate(
+    significance = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      p_value < 0.1   ~ ".",
+      TRUE            ~ ""
+    )
+  ) %>%
+  arrange(p_value)
+
+cat("\n── Significant predictors (p < 0.05) ──\n")
+lr_coefs %>% filter(p_value < 0.05) %>% kable() %>% print() 
+
+# ── Predictions ───────────────────────────────────────────────────────────────
+lr_probs <- predict(lr_model, newdata = test_model, type = "response")
+lr_preds <- factor(ifelse(lr_probs >= 0.5, "Yes", "No"),
+                   levels = c("No", "Yes"))
+
+confusionMatrix(lr_preds, test_model$churn, positive = "Yes")
+
+# ── ROC and PR ────────────────────────────────────────────────────────────────
+lr_roc <- roc(test_model$churn, lr_probs, levels = c("No", "Yes"), quiet = TRUE)
+
+# Check levels of both
+levels(lr_preds)
+levels(test_model$churn)
+
+# Check what values are actually in test_model$churn
+table(test_model$churn)
+
+# Check lr_probs range
+summary(lr_probs)
+
+lr_pr <- pr.curve(
+  scores.class0 = lr_probs[test_model$churn == "Yes"],
+  scores.class1 = lr_probs[test_model$churn == "No"],
+  curve         = TRUE
+)
+
+par(mfrow = c(1, 2))
+
+plot(lr_roc,
+     main = paste0("ROC Curve — Logistic Regression\nAUC = ", round(auc(lr_roc), 3)),
+     col  = "steelblue", lwd = 2)
+
+plot(lr_pr,
+     main     = paste0("PR Curve — Logistic Regression\nAUC = ", round(lr_pr$auc.integral, 3)),
+     col      = "steelblue", lwd = 2,
+     auc.main = FALSE)
+
+par(mfrow = c(1, 1))
+
+cat("ROC AUC — Logistic Regression:", round(auc(lr_roc), 4), "\n")
+cat("PR AUC  — Logistic Regression:", round(lr_pr$auc.integral, 4), "\n")
+```
+
+# ── MODEL 1B: LOGISTIC REGRESSION — SIGNIFICANT VARIABLES ONLY ───────────────
+```{r}
+set.seed(31)
+
+# Extract significant base variable names (p < 0.05) from full model
+# Strip factor level suffixes to get original column names
+sig_vars <- lr_coefs %>%
+  filter(p_value < 0.05, variable != "(Intercept)") %>%
+  pull(variable)
+
+# Match back to actual column names in train_model
+# Factor variables appear as e.g. "occupationProfessional" — strip suffix
+all_cols <- names(train_model %>% select(-churn))
+
+sig_cols <- unique(unlist(lapply(all_cols, function(col) {
+  if (any(startsWith(sig_vars, col))) col else NULL
+})))
+
+cat("Significant predictors selected:\n")
+print(sig_cols)
+
+# Build reduced datasets
+train_lr_sig <- train_model %>% select(all_of(sig_cols), churn)
+test_lr_sig  <- test_model  %>% select(all_of(sig_cols), churn)
+
+# Fit reduced model
+lr_model_sig <- glm(
+  churn ~ .,
+  data   = train_lr_sig,
+  family = binomial()
+)
+
+summary(lr_model_sig)
+
+# ── Predictions ───────────────────────────────────────────────────────────────
+lr_probs_sig <- predict(lr_model_sig, newdata = test_lr_sig, type = "response")
+lr_preds_sig <- factor(ifelse(lr_probs_sig >= 0.5, "Yes", "No"),
+                       levels = c("No", "Yes"))
+
+confusionMatrix(lr_preds_sig, test_lr_sig$churn, positive = "Yes")
+
+# ── ROC and PR ────────────────────────────────────────────────────────────────
+lr_roc_sig <- roc(test_lr_sig$churn, lr_probs_sig,
+                  levels = c("No", "Yes"), quiet = TRUE)
+
+lr_pr_sig <- pr.curve(
+  scores.class0 = lr_probs_sig[test_lr_sig$churn == "Yes"],
+  scores.class1 = lr_probs_sig[test_lr_sig$churn == "No"],
+  curve         = TRUE
+)
+
+par(mfrow = c(1, 2))
+
+plot(lr_roc_sig,
+     main = paste0("ROC Curve — LR Significant Only\nAUC = ",
+                   round(auc(lr_roc_sig), 3)),
+     col  = "steelblue", lwd = 2)
+
+plot(lr_pr_sig,
+     main     = paste0("PR Curve — LR Significant Only\nAUC = ",
+                       round(lr_pr_sig$auc.integral, 3)),
+     col      = "steelblue", lwd = 2,
+     auc.main = FALSE)
+
+par(mfrow = c(1, 1))
+
+cat("ROC AUC — LR Significant Only:", round(auc(lr_roc_sig), 4), "\n")
+cat("PR AUC  — LR Significant Only:", round(lr_pr_sig$auc.integral, 4), "\n")
+
+# ── Comparison table — all variables vs significant only ─────────────────────
+
+# Helper to extract confusion matrix metrics
+get_cm_metrics <- function(preds, truth) {
+  cm <- confusionMatrix(preds, truth, positive = "Yes")
+  tibble(
+    Precision   = round(cm$byClass["Precision"],   4),
+    Recall      = round(cm$byClass["Sensitivity"], 4),
+    F1          = round(cm$byClass["F1"],           4),
+    Specificity = round(cm$byClass["Specificity"],  4),
+    Accuracy    = round(cm$overall["Accuracy"],     4)
+  )
+}
+
+lr_all_metrics <- get_cm_metrics(lr_preds,     test_model$churn)
+lr_sig_metrics <- get_cm_metrics(lr_preds_sig, test_lr_sig$churn)
+
+comparison_lr <- bind_rows(
+  tibble(Model = "LR — All Variables",         
+         ROC_AUC = round(auc(lr_roc),     4),
+         PR_AUC  = round(lr_pr$auc.integral, 4)) %>%
+    bind_cols(lr_all_metrics),
+  
+  tibble(Model = "LR — Significant Only",      
+         ROC_AUC = round(auc(lr_roc_sig), 4),
+         PR_AUC  = round(lr_pr_sig$auc.integral, 4)) %>%
+    bind_cols(lr_sig_metrics)
+)
+
+cat("\n── Logistic Regression Comparison ──\n")
+print(comparison_lr)
+```
+
+## ═════════════════════════════════════════════════════════════════════════════
+## MODEL 2: RANDOM FOREST
+## ═════════════════════════════════════════════════════════════════════════════
+
+```{r random-forest}
+set.seed(31)
+
+mtry_fixed    <- floor(sqrt(ncol(train_model) - 1))
+rf_grid_fixed <- expand.grid(mtry = mtry_fixed)
+
+rf_model <- train(
+  churn ~ .,
+  data      = train_model,
+  method    = "rf",
+  trControl = ctrl_none,
+  tuneGrid  = rf_grid_fixed,
+  ntree     = 500
+)
+
+# ── Feature importance ────────────────────────────────────────────────────────
+rf_importance <- varImp(rf_model, scale = TRUE)
+plot(rf_importance, top = 20, main = "Feature Importance — Random Forest")
+
+# ── Predictions ───────────────────────────────────────────────────────────────
+rf_probs <- predict(rf_model, test_model, type = "prob")[, "Yes"]
+rf_preds <- predict(rf_model, test_model)
+
+confusionMatrix(rf_preds, test_model$churn, positive = "Yes")
+
+# ── ROC and PR ────────────────────────────────────────────────────────────────
+rf_roc <- roc(test_model$churn, rf_probs, levels = c("No", "Yes"), quiet = TRUE)
+
+rf_pr <- pr.curve(
+  scores.class0 = rf_probs[test_model$churn == "Yes"],
+  scores.class1 = rf_probs[test_model$churn == "No"],
+  curve         = TRUE
+)
+
+par(mfrow = c(1, 2))
+
+plot(rf_roc,
+     main = paste0("ROC Curve — Random Forest\nAUC = ", round(auc(rf_roc), 3)),
+     col  = "#003087", lwd = 2)
+
+plot(rf_pr,
+     main     = paste0("PR Curve — Random Forest\nAUC = ", round(rf_pr$auc.integral, 3)),
+     col      = "#CC8800", lwd = 2,
+     auc.main = FALSE)
+
+par(mfrow = c(1, 1))
+
+cat("ROC AUC — Random Forest:", round(auc(rf_roc), 4), "\n")
+cat("PR AUC  — Random Forest:", round(rf_pr$auc.integral, 4), "\n")
+```
+
+# ── RF with LR-significant variables only ────────────────────────────────────
+```{r rf-lr-sig-vars}
+# Reuses sig_cols from Model 1B (LR significant-variables-only model) above.
+
+set.seed(31)
+
+train_rf_lrsig <- train_model %>% select(all_of(sig_cols), churn)
+test_rf_lrsig  <- test_model  %>% select(all_of(sig_cols), churn)
+
+mtry_lrsig <- floor(sqrt(ncol(train_rf_lrsig) - 1))
+
+rf_model_lrsig <- train(
+  churn ~ .,
+  data      = train_rf_lrsig,
+  method    = "rf",
+  trControl = ctrl_none,
+  tuneGrid  = expand.grid(mtry = mtry_lrsig),
+  ntree     = 500
+)
+
+rf_probs_lrsig <- predict(rf_model_lrsig, test_rf_lrsig, type = "prob")[, "Yes"]
+rf_preds_lrsig <- predict(rf_model_lrsig, test_rf_lrsig)
+
+cat("\n══ RF — LR-Significant Variables (n =", length(sig_cols), ") ══\n")
+print(confusionMatrix(rf_preds_lrsig, test_rf_lrsig$churn, positive = "Yes"))
+
+rf_roc_lrsig <- roc(test_rf_lrsig$churn, rf_probs_lrsig, levels = c("No", "Yes"), quiet = TRUE)
+rf_pr_lrsig <- pr.curve(
+  scores.class0 = rf_probs_lrsig[test_rf_lrsig$churn == "Yes"],
+  scores.class1 = rf_probs_lrsig[test_rf_lrsig$churn == "No"],
+  curve = TRUE
+)
+
+par(mfrow = c(1, 2))
+plot(rf_roc_lrsig,
+     main = paste0("ROC — RF (LR-sig vars)\nAUC = ", round(auc(rf_roc_lrsig), 3)),
+     col = "purple", lwd = 2)
+plot(rf_pr_lrsig,
+     main = paste0("PR — RF (LR-sig vars)\nAUC = ", round(rf_pr_lrsig$auc.integral, 3)),
+     col = "purple", lwd = 2, auc.main = FALSE)
+par(mfrow = c(1, 1))
+
+cat("ROC AUC — RF (LR-sig vars):", round(auc(rf_roc_lrsig), 4), "\n")
+cat("PR AUC  — RF (LR-sig vars):", round(rf_pr_lrsig$auc.integral, 4), "\n")
+```
+
+# ── RF with top 14 Gini-importance variables (self-selected, from full RF) ──
+```{r rf-top14-gini}
+# Reuses rf_model/rf_importance from Model 2 (full-variable RF) above.
+# varImp() with scale = TRUE returns %-scaled importance; rank order (not
+# the scaled value itself) is what determines "top 14" here.
+
+set.seed(31)
+
+top14_gini <- rf_importance$importance %>%
+  as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  arrange(desc(Overall)) %>%
+  slice_head(n = 14) %>%
+  pull(variable)
+
+cat("Top 14 Gini-importance variables:\n")
+print(top14_gini)
+
+setdiff(top14_gini, names(train_model))
+
+train_rf_gini14 <- train_model %>% select(all_of(top14_gini), churn)
+test_rf_gini14  <- test_model  %>% select(all_of(top14_gini), churn)
+
+mtry_gini14 <- floor(sqrt(ncol(train_rf_gini14) - 1))
+
+rf_model_gini14 <- train(
+  churn ~ .,
+  data      = train_rf_gini14,
+  method    = "rf",
+  trControl = ctrl_none,
+  tuneGrid  = expand.grid(mtry = mtry_gini14),
+  ntree     = 500
+)
+
+rf_probs_gini14 <- predict(rf_model_gini14, test_rf_gini14, type = "prob")[, "Yes"]
+rf_preds_gini14 <- predict(rf_model_gini14, test_rf_gini14)
+
+cat("\n══ RF — Top 14 Gini-Importance Variables ══\n")
+print(confusionMatrix(rf_preds_gini14, test_rf_gini14$churn, positive = "Yes"))
+
+rf_roc_gini14 <- roc(test_rf_gini14$churn, rf_probs_gini14, levels = c("No", "Yes"), quiet = TRUE)
+rf_pr_gini14 <- pr.curve(
+  scores.class0 = rf_probs_gini14[test_rf_gini14$churn == "Yes"],
+  scores.class1 = rf_probs_gini14[test_rf_gini14$churn == "No"],
+  curve = TRUE
+)
+
+par(mfrow = c(1, 2))
+plot(rf_roc_gini14,
+     main = paste0("ROC — RF (Top 14 Gini)\nAUC = ", round(auc(rf_roc_gini14), 3)),
+     col = "orange3", lwd = 2)
+plot(rf_pr_gini14,
+     main = paste0("PR — RF (Top 14 Gini)\nAUC = ", round(rf_pr_gini14$auc.integral, 3)),
+     col = "orange3", lwd = 2, auc.main = FALSE)
+par(mfrow = c(1, 1))
+
+cat("ROC AUC — RF (Top 14 Gini):", round(auc(rf_roc_gini14), 4), "\n")
+cat("PR AUC  — RF (Top 14 Gini):", round(rf_pr_gini14$auc.integral, 4), "\n")
+```
+
+```{r}
+
+set.seed(31)
+
+boruta_result <- Boruta(
+  churn ~ .,
+  data      = train_model,
+  maxRuns   = 20,
+  doTrace   = 1
+)
+
+# Summary
+print(boruta_result)
+
+# Plot
+plot(boruta_result,
+     las  = 2,
+     cex.axis = 0.6,
+     main = "Boruta Feature Selection — Random Forest")
+
+# Confirmed variables
+confirmed_vars <- getSelectedAttributes(boruta_result, withTentative = FALSE)
+cat("\nConfirmed variables:\n")
+print(confirmed_vars)
+
+# Tentative variables — borderline, inspect manually
+tentative_vars <- getSelectedAttributes(boruta_result, withTentative = TRUE)
+cat("\nConfirmed + Tentative:\n")
+print(tentative_vars)
+
+# ── RF model with Boruta-selected variables only ──────────────────────────────
+
+train_rf_boruta <- train_model %>% select(all_of(confirmed_vars), churn)
+test_rf_boruta  <- test_model  %>% select(all_of(confirmed_vars), churn)
+
+mtry_boruta    <- floor(sqrt(length(confirmed_vars)))
+rf_grid_boruta <- expand.grid(mtry = mtry_boruta)
+
+set.seed(31)
+
+rf_model_boruta <- train(
+  churn ~ .,
+  data      = train_rf_boruta,
+  method    = "rf",
+  trControl = ctrl_none,
+  tuneGrid  = rf_grid_boruta,
+  ntree     = 500
+)
+
+# ── Predictions ───────────────────────────────────────────────────────────────
+rf_probs_boruta <- predict(rf_model_boruta, test_rf_boruta, type = "prob")[, "Yes"]
+
+rf_preds_boruta <- factor(
+  ifelse(rf_probs_boruta >= 0.5, "Yes", "No"),
+  levels = c("No", "Yes")
+)
+
+confusionMatrix(rf_preds_boruta, test_rf_boruta$churn, positive = "Yes")
+
+# ── ROC and PR ────────────────────────────────────────────────────────────────
+rf_roc_boruta <- roc(test_rf_boruta$churn, rf_probs_boruta,
+                     levels = c("No", "Yes"), quiet = TRUE)
+
+rf_pr_boruta <- pr.curve(
+  scores.class0 = rf_probs_boruta[test_rf_boruta$churn == "Yes"],
+  scores.class1 = rf_probs_boruta[test_rf_boruta$churn == "No"],
+  curve         = TRUE
+)
+
+par(mfrow = c(1, 2))
+
+plot(rf_roc,
+     main = paste0("ROC Curve — RF Boruta\nAUC = ", round(auc(rf_roc_boruta), 3)),
+     col  = "#003087", lwd = 2)
+
+plot(rf_pr,
+     main     = paste0("PR Curve — RF Boruta\nAUC = ", round(rf_pr_boruta$auc.integral, 3)),
+     col      = "#CC8800", lwd = 2,
+     auc.main = FALSE)
+
+par(mfrow = c(1, 1))
+
+# ── Comparison table ──────────────────────────────────────────────────────────
+
+rf_all_metrics    <- get_cm_metrics(rf_preds,        test_model$churn)
+rf_boruta_metrics <- get_cm_metrics(rf_preds_boruta, test_rf_boruta$churn)
+
+comparison_rf <- bind_rows(
+  tibble(Model   = "RF — All Variables",
+         ROC_AUC = round(auc(rf_roc), 4),
+         PR_AUC  = round(rf_pr$auc.integral, 4)) %>%
+    bind_cols(rf_all_metrics),
+
+  tibble(Model   = "RF — Boruta Selected",
+         ROC_AUC = round(auc(rf_roc_boruta), 4),
+         PR_AUC  = round(rf_pr_boruta$auc.integral, 4)) %>%
+    bind_cols(rf_boruta_metrics)
+)
+
+cat("\n── Random Forest Comparison ──\n")
+print(comparison_rf)
+
+# ── Feature Importance — Random Forest (Boruta) ───────────────────────────────
+
+plot(varImp(rf_model_boruta, scale = TRUE), top = 20, main = "Feature Importance — RF (Boruta)")
+```
+
+```{r}
+# ── Cumulative Gains and Decile-Wise Chart — Random Forest (Boruta) ───────────
+
+# ── 1. Build gains table ──────────────────────────────────────────────────────
+
+gains_table <- test_rf_boruta %>%
+  mutate(prob = rf_probs_boruta) %>%
+  arrange(desc(prob)) %>%
+  mutate(
+    rank          = row_number(),
+    decile        = ntile(desc(prob), 10),
+    actual_churn  = as.numeric(churn == "Yes"),
+    cumulative_n  = row_number(),
+    cumulative_churners = cumsum(actual_churn)
+  ) %>%
+  group_by(decile) %>%
+  summarise(
+    n                   = n(),
+    churners            = sum(actual_churn),
+    churn_rate          = mean(actual_churn) * 100,
+    cumulative_n        = max(cumulative_n),
+    cumulative_churners = max(cumulative_churners),
+    .groups             = "drop"
+  ) %>%
+  mutate(
+    cumulative_pct_customers = cumulative_n / nrow(test_rf_boruta) * 100,
+    cumulative_pct_churners  = cumulative_churners / sum(churners) * 100,
+    lift                     = (churners / n) / (sum(churners) / nrow(test_rf_boruta))
+  )
+
+cat("\n── Decile Table (Boruta) ──\n")
+print(gains_table)
+
+# ── 2. Cumulative gains chart ─────────────────────────────────────────────────
+
+# Add baseline and perfect model points
+baseline <- tibble(
+  cumulative_pct_customers = c(0, 100),
+  cumulative_pct_churners  = c(0, 100),
+  model = "Baseline (Random)"
+)
+
+perfect <- tibble(
+  cumulative_pct_customers = c(0, sum(gains_table$churners) / nrow(test_rf_boruta) * 100, 100),
+  cumulative_pct_churners  = c(0, 100, 100),
+  model = "Perfect Model"
+)
+
+rf_gains <- gains_table %>%
+  select(cumulative_pct_customers, cumulative_pct_churners) %>%
+  add_row(cumulative_pct_customers = 0,
+          cumulative_pct_churners  = 0,
+          .before = 1) %>%
+  mutate(model = "Random Forest (Boruta)")
+
+bind_rows(rf_gains, baseline, perfect) %>%
+  ggplot(aes(cumulative_pct_customers, cumulative_pct_churners,
+             colour = model, linetype = model)) +
+  geom_line(lwd = 1) +
+  scale_colour_manual(values = c(
+    "Random Forest (Boruta)" = "darkgreen",
+    "Baseline (Random)"      = "grey50",
+    "Perfect Model"          = "steelblue"
+  )) +
+  scale_linetype_manual(values = c(
+    "Random Forest (Boruta)" = "solid",
+    "Baseline (Random)"      = "dashed",
+    "Perfect Model"          = "dotted"
+  )) +
+  labs(
+    title    = "Cumulative Gains Chart — Random Forest (Boruta)",
+    x        = "% of Customers Contacted (by Score)",
+    y        = "% of Churners Captured",
+    colour   = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottomright")
+
+# ── 3. Decile-wise lift chart ─────────────────────────────────────────────────
+
+gains_table %>%
+  ggplot(aes(x = factor(decile), y = lift,
+             fill = lift >= 1)) +
+  geom_col() +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "#CC8800", linewidth = 0.8) +
+  geom_text(aes(label = round(lift, 2)), vjust = -0.5, size = 3.5,
+            colour = "grey30") +
+  scale_fill_manual(values = c("TRUE" = "#003087", "FALSE" = "#94A8C7")) +
+  labs(
+    title   = "Decile-Wise Lift Chart — Random Forest (Boruta)",
+    x       = "Decile",
+    y       = "Lift",
+    caption = "Dashed line = lift of 1.0 (no improvement over random)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    axis.title      = element_text(size = 9),
+    axis.text       = element_text(size = 8),
+    plot.caption    = element_text(size = 7, colour = "grey50")
+  )
+
+# ── 4. Decile churn rate chart ────────────────────────────────────────────────
+
+gains_table %>%
+  ggplot(aes(x = factor(decile), y = churn_rate, fill = factor(decile))) +
+  geom_col() +
+  geom_hline(
+    yintercept = sum(gains_table$churners) / nrow(test_rf_boruta) * 100,
+    linetype   = "dashed", colour = "red"
+  ) +
+  geom_text(aes(label = paste0(round(churn_rate, 1), "%")),
+            vjust = -0.5, size = 3.5) +
+  scale_fill_brewer(palette = "Greens") +
+  annotate("text",
+           x     = 10.4,
+           y     = sum(gains_table$churners) / nrow(test_rf_boruta) * 100 + 0.5,
+           label = "Baseline",
+           size  = 3, colour = "red", hjust = 1) +
+  labs(
+    title   = "Churn Rate by Decile — Random Forest (Boruta)",
+    x       = "Decile (1 = Highest Predicted Churn)",
+    y       = "Actual Churn Rate (%)",
+    caption = "Dashed line = overall churn rate baseline"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+# ── MODEL 3: XGBOOST ─────────────────────────────────────────────────────────
+
+
+set.seed(31)
+
+# ── Helper: build DMatrix from model dataframe ────────────────────────────────
+
+# ── Helper: prepare XGBoost matrix without model.matrix ──────────────────────
+
+prepare_xgb_matrix <- function(df, label_col = "churn") {
+  labels <- as.numeric(df[[label_col]] == "Yes")
+  
+  # Remove label column
+  df_features <- df %>% select(-all_of(label_col))
+  
+  # Convert each column type explicitly
+  df_numeric <- df_features %>%
+    mutate(across(where(is.factor), ~ as.numeric(.))) %>%
+    mutate(across(where(is.logical), ~ as.numeric(.))) %>%
+    mutate(across(everything(), ~ as.numeric(.)))
+  
+  # Check for any remaining non-numeric
+  cat("Non-numeric columns remaining:", 
+      sum(!sapply(df_numeric, is.numeric)), "\n")
+  cat("Dimensions:", dim(df_numeric), "\n")
+  
+  mat <- as.matrix(df_numeric)
+  xgb.DMatrix(data = mat, label = labels)
+}
+
+dtrain <- prepare_xgb_matrix(train_model)
+dtest  <- prepare_xgb_matrix(test_model)
+
+# ── XGBoost parameters ────────────────────────────────────────────────────────
+
+xgb_params <- list(
+  objective        = "binary:logistic",
+  eval_metric      = "auc",
+  eta              = 0.1,
+  max_depth        = 6,
+  min_child_weight = 1,
+  subsample        = 0.8,
+  colsample_bytree = 0.8
+)
+
+# ── Helper: evaluate model ────────────────────────────────────────────────────
+
+evaluate_xgb <- function(model, dtest_mat, test_df, label) {
+  probs <- predict(model, dtest_mat)
+  preds <- factor(ifelse(probs >= 0.5, "Yes", "No"), levels = c("No", "Yes"))
+
+  cat("\n══", label, "══\n")
+  print(confusionMatrix(preds, test_df$churn, positive = "Yes"))
+
+  roc_obj <- roc(test_df$churn, probs, levels = c("No", "Yes"), quiet = TRUE)
+  pr_obj  <- pr.curve(
+    scores.class0 = probs[test_df$churn == "Yes"],
+    scores.class1 = probs[test_df$churn == "No"],
+    curve         = TRUE
+  )
+
+  par(mfrow = c(1, 2))
+  plot(roc_obj,
+       main = paste0("ROC — ", label, "\nAUC = ", round(auc(roc_obj), 3)),
+       col  = "firebrick", lwd = 2)
+  plot(pr_obj,
+       main     = paste0("PR — ", label, "\nAUC = ", round(pr_obj$auc.integral, 3)),
+       col      = "firebrick", lwd = 2,
+       auc.main = FALSE)
+  par(mfrow = c(1, 1))
+
+  cat("ROC AUC:", round(auc(roc_obj), 4), "\n")
+  cat("PR AUC: ", round(pr_obj$auc.integral, 4), "\n")
+
+  list(model = model, probs = probs, roc = roc_obj, pr = pr_obj)
+}
+
+## ═════════════════════════════════════════════════════════════════════════════
+## XGBOOST — ALL VARIABLES
+## ═════════════════════════════════════════════════════════════════════════════
+
+xgb_model <- xgb.train(
+  params        = xgb_params,
+  data          = dtrain,
+  nrounds       = 200,
+  watchlist     = list(train = dtrain, test = dtest),
+  verbose       = 1,
+  print_every_n = 20
+)
+
+# Feature importance
+xgb_importance <- xgb.importance(
+  feature_names = names(train_model %>% 
+                          select(-churn) %>%
+                          mutate(across(where(is.factor), as.numeric))),
+  model = xgb_model
+)
+xgb.plot.importance(xgb_importance, top_n = 20,
+                    main = "Feature Importance — XGBoost All Variables")
+
+# Evaluate
+xgb_results <- evaluate_xgb(xgb_model, dtest, test_model, "XGBoost — All Variables")
+```
+
+## ═════════════════════════════════════════════════════════════════════════════
+## MODEL COMPARISON
+## ═════════════════════════════════════════════════════════════════════════════
+
+```{r model-comparison}
+
+# ── 0. Helper function ────────────────────────────────────────────────────────
+
+get_all_metrics <- function(probs, true_labels, model_name, threshold = 0.5) {
+  preds <- factor(ifelse(probs >= threshold, "Yes", "No"),
+                  levels = c("No", "Yes"))
+  cm <- confusionMatrix(preds, true_labels, positive = "Yes")
+  tibble(
+    Model       = model_name,
+    Accuracy    = round(cm$overall["Accuracy"],    4),
+    Kappa       = round(cm$overall["Kappa"],       4),
+    Sensitivity = round(cm$byClass["Sensitivity"], 4),
+    Precision   = round(cm$byClass["Precision"],   4),
+    F1          = round(cm$byClass["F1"],          4)
+  )
+}
+
+# ── 1. Metrics table — all models at threshold = 0.5 ─────────────────────────
+# (Unchanged — this table compares every variant, including RF — All vs
+# RF — Boruta, so it deliberately keeps both rather than collapsing to one.)
+
+all_model_metrics <- bind_rows(
+  get_all_metrics(lr_probs,        test_model$churn,      "LR — All"),
+  get_all_metrics(lr_probs_sig,    test_lr_sig$churn,     "LR — Significant"),
+  get_all_metrics(rf_probs,        test_model$churn,      "RF — All"),
+  get_all_metrics(rf_probs_gini14, test_rf_gini14$churn,  "RF — Top 14 Gini"),
+  get_all_metrics(rf_probs_boruta, test_rf_boruta$churn,  "RF — Boruta"),
+  get_all_metrics(rf_probs_lrsig,  test_rf_lrsig$churn,   "RF — LR Significant"),
+  get_all_metrics(xgb_results$probs, test_model$churn,    "XGBoost — All")
+) %>%
+  arrange(desc(F1))
+
+auc_metrics <- tibble(
+  Model   = c("LR — All", "LR — Significant",
+              "RF — All", "RF — Top 14 Gini", "RF — Boruta",
+              "RF — LR Significant", "XGBoost — All"),
+  ROC_AUC = round(c(
+    auc(lr_roc),
+    auc(lr_roc_sig),
+    auc(rf_roc),
+    auc(rf_roc_gini14),
+    auc(rf_roc_boruta),
+    auc(rf_roc_lrsig),
+    auc(xgb_results$roc)
+  ), 4),
+  PR_AUC = round(c(
+    lr_pr$auc.integral,
+    lr_pr_sig$auc.integral,
+    rf_pr$auc.integral,
+    rf_pr_gini14$auc.integral,
+    rf_pr_boruta$auc.integral,
+    rf_pr_lrsig$auc.integral,
+    xgb_results$pr$auc.integral
+  ), 4)
+)
+
+full_comparison <- all_model_metrics %>%
+  left_join(auc_metrics, by = "Model") %>%
+  select(Model, ROC_AUC, PR_AUC, Accuracy, Kappa,
+         Sensitivity, Precision, F1)
+
+best_row <- which.max(full_comparison$F1)
+
+full_comparison %>%
+  kable(
+    caption = "Model Comparison — All Metrics at Threshold = 0.5",
+    align   = c("l", rep("c", 7))
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    position          = "center",
+    font_size         = 11
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#003087", color = "white") %>%
+  row_spec(best_row, background = "#FFF3CC", bold = TRUE) %>%
+  add_header_above(c(
+    " "              = 1,
+    "Ranking"        = 2,
+    "Overall"        = 2,
+    "Churn-Specific" = 3
+  ),
+  bold = TRUE, background = "#4A7BC4", color = "white") %>%
+  footnote(
+    general           = "All models evaluated at default threshold (0.5). Highlighted row = best F1 score.",
+    general_title     = "Note:",
+    footnote_as_chunk = TRUE
+  )
+
+# ── ROC and PR overlay — all models ──────────────────────────────────────────
+
+par(mfrow = c(1, 2))
+
+# ── ROC ───────────────────────────────────────────────────────────────────────
+
+plot(lr_roc,
+     col  = "steelblue", main = "ROC Curve Comparison",
+     lwd  = 1.5, lty = 2)
+plot(lr_roc_sig,
+     col  = "steelblue", add = TRUE, lwd = 1.5, lty = 3)
+plot(rf_roc,
+     col  = "darkgreen", add = TRUE, lwd = 2)
+plot(rf_roc_gini14,
+     col  = "darkgreen", add = TRUE, lwd = 1.5, lty = 2)
+plot(rf_roc_boruta,
+     col  = "darkgreen", add = TRUE, lwd = 1.5, lty = 3)
+plot(rf_roc_lrsig,
+     col  = "darkgreen", add = TRUE, lwd = 1.5, lty = 4)
+plot(xgb_results$roc,
+     col  = "firebrick", add = TRUE, lwd = 2)
+
+legend("bottomright",
+       legend = c(
+         paste0("LR — All (", round(auc(lr_roc), 3), ")"),
+         paste0("LR — Sig (", round(auc(lr_roc_sig), 3), ")"),
+         paste0("RF — All (", round(auc(rf_roc), 3), ")"),
+         paste0("RF — Gini14 (", round(auc(rf_roc_gini14), 3), ")"),
+         paste0("RF — Boruta (", round(auc(rf_roc_boruta), 3), ")"),
+         paste0("RF — LRSig (", round(auc(rf_roc_lrsig), 3), ")"),
+         paste0("XGB — All (", round(auc(xgb_results$roc), 3), ")")
+       ),
+       col = c("steelblue", "steelblue",
+               "darkgreen", "darkgreen", "darkgreen", "darkgreen",
+               "firebrick"),
+       lty = c(2, 3, 1, 2, 3, 4, 1),
+       lwd = c(1.5, 1.5, 2, 1.5, 1.5, 1.5, 2),
+       cex = 0.55
+)
+
+# ── PR ────────────────────────────────────────────────────────────────────────
+
+plot(lr_pr,
+     col      = "steelblue", main = "PR Curve Comparison",
+     lwd      = 1.5, lty = 2,
+     auc.main = FALSE)
+plot(lr_pr_sig,
+     col      = "steelblue", add = TRUE, lwd = 1.5, lty = 3,
+     auc.main = FALSE)
+plot(rf_pr,
+     col      = "darkgreen", add = TRUE, lwd = 2,
+     auc.main = FALSE)
+plot(rf_pr_gini14,
+     col      = "darkgreen", add = TRUE, lwd = 1.5, lty = 2,
+     auc.main = FALSE)
+plot(rf_pr_boruta,
+     col      = "darkgreen", add = TRUE, lwd = 1.5, lty = 3,
+     auc.main = FALSE)
+plot(rf_pr_lrsig,
+     col      = "darkgreen", add = TRUE, lwd = 1.5, lty = 4,
+     auc.main = FALSE)
+plot(xgb_results$pr,
+     col      = "firebrick", add = TRUE, lwd = 2,
+     auc.main = FALSE)
+
+legend("topright",
+       legend = c(
+         paste0("LR — All (", round(lr_pr$auc.integral, 3), ")"),
+         paste0("LR — Sig (", round(lr_pr_sig$auc.integral, 3), ")"),
+         paste0("RF — All (", round(rf_pr$auc.integral, 3), ")"),
+         paste0("RF — Gini14 (", round(rf_pr_gini14$auc.integral, 3), ")"),
+         paste0("RF — Boruta (", round(rf_pr_boruta$auc.integral, 3), ")"),
+         paste0("RF — LRSig (", round(rf_pr_lrsig$auc.integral, 3), ")"),
+         paste0("XGB — All (", round(xgb_results$pr$auc.integral, 3), ")")
+       ),
+       col = c("steelblue", "steelblue",
+               "darkgreen", "darkgreen", "darkgreen", "darkgreen",
+               "firebrick"),
+       lty = c(2, 3, 1, 2, 3, 4, 1),
+       lwd = c(1.5, 1.5, 2, 1.5, 1.5, 1.5, 2),
+       cex = 0.55
+)
+
+par(mfrow = c(1, 1))
+```
+
+# ── Threshold Tuning — LR and RF (Boruta) ────────────────────────────────────
+```{r}
+thresholds <- seq(0.1, 0.9, by = 0.01)
+
+# ── 1. Threshold tuning function ──────────────────────────────────────────────
+
+tune_threshold <- function(probs, true_labels, model_name) {
+  map_dfr(thresholds, function(t) {
+    preds <- factor(ifelse(probs >= t, "Yes", "No"),
+                    levels = c("No", "Yes"))
+    cm <- confusionMatrix(preds, true_labels, positive = "Yes")
+    tibble(
+      model       = model_name,
+      threshold   = t,
+      sensitivity = cm$byClass["Sensitivity"],
+      precision   = cm$byClass["Precision"],
+      specificity = cm$byClass["Specificity"],
+      f1          = cm$byClass["F1"]
+    )
+  })
+}
+
+lr_thresholds <- tune_threshold(lr_probs, test_model$churn, "Logistic Regression")
+rf_thresholds <- tune_threshold(rf_probs_boruta, test_rf_boruta$churn, "Random Forest")
+
+all_thresholds <- bind_rows(lr_thresholds, rf_thresholds)
+
+# ── 2. Plot threshold curves ───────────────────────────────────────────────────
+
+all_thresholds %>%
+  pivot_longer(cols     = c(sensitivity, precision, f1),
+               names_to = "metric", values_to = "value") %>%
+  ggplot(aes(threshold, value, colour = metric)) +
+  geom_line(lwd = 0.8) +
+  geom_vline(xintercept = 0.5,  linetype = "dashed", colour = "grey40") +
+  facet_wrap(~ model) +
+  labs(title = "Threshold Tuning — LR and RF (Boruta)",
+       x = "Threshold", y = "Value") +
+  theme_minimal()
+
+# ── 3. Find optimal thresholds ────────────────────────────────────────────────
+
+# Youden's J optimised — pROC::coords()
+roc_lr <- roc(test_model$churn, lr_probs, levels = c("No", "Yes"), direction = "<")
+roc_rf <- roc(test_rf_boruta$churn, rf_probs_boruta, levels = c("No", "Yes"), direction = "<")
+
+youden_lr <- coords(roc_lr, "best", best.method = "youden",
+                     ret = c("threshold", "sensitivity", "specificity"))
+youden_rf <- coords(roc_rf, "best", best.method = "youden",
+                     ret = c("threshold", "sensitivity", "specificity"))
+
+best_youden <- bind_rows(
+  tibble(model = "Logistic Regression", threshold = youden_lr$threshold,
+         sensitivity = youden_lr$sensitivity, specificity = youden_lr$specificity),
+  tibble(model = "Random Forest", threshold = youden_rf$threshold,
+         sensitivity = youden_rf$sensitivity, specificity = youden_rf$specificity)
+)
+
+# F1 optimised
+best_f1 <- all_thresholds %>%
+  group_by(model) %>%
+  filter(f1 == max(f1, na.rm = TRUE)) %>%
+  slice(1) %>%
+  select(model, threshold, sensitivity, precision, f1)
+
+cat("\n── Best threshold by Youden's J ──\n")
+print(best_youden)
+
+cat("\n── Best threshold by F1 ──\n")
+print(best_f1)
+
+# ── 4. Evaluate all three thresholds per model ────────────────────────────────
+
+evaluate_threshold <- function(probs, true_labels, model_name, t, label) {
+  preds <- factor(ifelse(probs >= t, "Yes", "No"),
+                  levels = c("No", "Yes"))
+  cm <- confusionMatrix(preds, true_labels, positive = "Yes")
+  tibble(
+    Model       = model_name,
+    Threshold   = paste0(label, " (", round(t, 3), ")"),
+    Sensitivity = round(cm$byClass["Sensitivity"], 4),
+    Precision   = round(cm$byClass["Precision"],   4),
+    F1          = round(cm$byClass["F1"],           4),
+    Specificity = round(cm$byClass["Specificity"],  4),
+    Accuracy    = round(cm$overall["Accuracy"],     4)
+  )
+}
+
+# LR thresholds
+t_lr_youden <- best_youden %>% filter(model == "Logistic Regression") %>% pull(threshold)
+t_lr_f1     <- best_f1     %>% filter(model == "Logistic Regression") %>% pull(threshold)
+
+# RF (Boruta) thresholds
+t_rf_youden <- best_youden %>% filter(model == "Random Forest") %>% pull(threshold)
+t_rf_f1     <- best_f1     %>% filter(model == "Random Forest") %>% pull(threshold)
+
+comparison_threshold <- bind_rows(
+  # Logistic Regression
+  evaluate_threshold(lr_probs, test_model$churn, "Logistic Regression", 0.50,        "Default"),
+  evaluate_threshold(lr_probs, test_model$churn, "Logistic Regression", t_lr_youden, "Youden's J"),
+  evaluate_threshold(lr_probs, test_model$churn, "Logistic Regression", t_lr_f1,     "F1"),
+
+  # Random Forest (Boruta)
+  evaluate_threshold(rf_probs_boruta, test_rf_boruta$churn, "Random Forest", 0.50,        "Default"),
+  evaluate_threshold(rf_probs_boruta, test_rf_boruta$churn, "Random Forest", t_rf_youden, "Youden's J"),
+  evaluate_threshold(rf_probs_boruta, test_rf_boruta$churn, "Random Forest", t_rf_f1,     "F1")
+)
+
+cat("\n── Threshold Comparison — LR and RF (Boruta) ──\n")
+print(comparison_threshold)
+
+# ── 5. Visual summary ─────────────────────────────────────────────────────────
+
+comparison_threshold %>%
+  pivot_longer(cols     = c(Sensitivity, Precision, F1, Specificity),
+               names_to = "Metric", values_to = "Value") %>%
+  ggplot(aes(x = Threshold, y = Value, fill = Metric)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ Model) +
+  labs(title = "Performance by Threshold Strategy — LR and RF (Boruta)",
+       x = "Threshold Strategy", y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+# ── Confusion Matrix — Best Model (RF Boruta) at Best Threshold (F1-optimised) ──
+
+final_preds <- factor(ifelse(rf_probs_boruta >= t_rf_f1, "Yes", "No"),
+                       levels = c("No", "Yes"))
+
+final_cm <- confusionMatrix(final_preds, test_rf_boruta$churn, positive = "Yes")
+
+cat("\n── Final Confusion Matrix — Random Forest (Boruta) @ Threshold", round(t_rf_f1, 3), "──\n")
+print(final_cm)
+
+# report
+
+comparison_threshold %>%
+  mutate(across(c(Sensitivity, Precision, F1, Specificity, Accuracy),
+                ~ round(., 3))) %>%
+  kable(
+    caption = "Model Performance by Threshold Strategy",
+    align   = c("l", "l", "c", "c", "c", "c", "c")
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    position          = "center"
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#003087", color = "white") %>%
+  column_spec(1, bold = TRUE) %>%
+  row_spec(
+    which(comparison_threshold$Model == "Random Forest" &
+          grepl("F1", comparison_threshold$Threshold)),
+    background = "#FFF3CC", bold = TRUE
+  )
+#--
+final_preds <- factor(ifelse(rf_probs_boruta >= t_rf_f1, "Yes", "No"),
+                      levels = c("No", "Yes"))
+
+final_cm <- confusionMatrix(final_preds, test_rf_boruta$churn, positive = "Yes")
+cm_table <- as.data.frame(final_cm$table) %>%
+  rename(Predicted = Prediction, Actual = Reference)
+
+# Pivot to wide for display
+cm_wide <- cm_table %>%
+  pivot_wider(names_from = Actual, values_from = Freq) %>%
+  rename(`Predicted \\ Actual` = Predicted)
+
+cm_wide %>%
+  kable(
+    caption = paste0(
+      "Confusion Matrix — Random Forest (Boruta) @ Threshold = ",
+      round(t_rf_f1, 3)
+    ),
+    align = "c"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("bordered", "condensed"),
+    full_width        = FALSE,
+    position          = "center"
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#003087", color = "white") %>%
+  column_spec(1, bold = TRUE, background = "#003087", color = "white") %>%
+  column_spec(2, background = "#E8EEF7") %>%
+  column_spec(3, background = "#FFF3CC") %>%
+  add_header_above(
+    c(" " = 1, "Actual" = 2),
+    bold       = TRUE,
+    background = "#003087",
+    color      = "white"
+  )
+
+# ── Lock in the final selected model ──────────────────────────────────────────
+# RF (Boruta) is now the model carried forward into the persona breakdown,
+# evaluation scoring, and decision optimisation sections below. Saving it
+# here guarantees identical downstream results (predictions, SHAP/break-down
+# values, thresholds) regardless of how many times this script is re-knit or
+# which chunks are re-run interactively.
+saveRDS(rf_model_boruta, "rf_model_final.rds")
+cat("Final Random Forest (Boruta) model saved to rf_model_final.rds\n")
+```
+
+# 11. Persona Break-Down Analysis
+
+```{r}
+# ── Persona Break-Down Analysis — RF Boruta Variables ─────────────────────────
+
+set.seed(31)
+
+# ── 1. Create explainer ───────────────────────────────────────────────────────
+
+explainer_rf <- explain(
+  model   = rf_model_boruta,
+  data    = test_rf_boruta %>% select(-churn),
+  y       = as.numeric(test_rf_boruta$churn == "Yes"),
+  label   = "Random Forest (Boruta)",
+  verbose = FALSE
+)
+
+# ── 2. Select three personas ──────────────────────────────────────────────────
+
+test_with_probs <- test_rf_boruta %>% mutate(prob = rf_probs_boruta)
+
+# Persona 1 — High risk: top 10% predicted probability
+persona_churn <- test_with_probs %>%
+  filter(prob >= quantile(prob, 0.90)) %>%
+  mutate(dist = abs(prob - median(prob[prob >= quantile(prob, 0.90)]))) %>%
+  arrange(dist) %>%
+  slice(1) %>%
+  select(-churn, -prob, -dist)
+
+prob_churn <- test_with_probs %>%
+  filter(prob >= quantile(prob, 0.90)) %>%
+  pull(prob) %>% median()
+
+# Persona 2 — Low risk: bottom 10% predicted probability
+persona_stays <- test_with_probs %>%
+  filter(prob <= quantile(prob, 0.10)) %>%
+  mutate(dist = abs(prob - median(prob[prob <= quantile(prob, 0.10)]))) %>%
+  arrange(dist) %>%
+  slice(1) %>%
+  select(-churn, -prob, -dist)
+
+prob_stays <- test_with_probs %>%
+  filter(prob <= quantile(prob, 0.10)) %>%
+  pull(prob) %>% median()
+
+# Persona 3 — Borderline: closest to threshold
+persona_border <- test_with_probs %>%
+  mutate(dist = abs(prob - t_rf_f1)) %>%
+  arrange(dist) %>%
+  slice(1) %>%
+  select(-churn, -prob, -dist)
+
+prob_border <- test_with_probs %>%
+  mutate(dist = abs(prob - t_rf_f1)) %>%
+  arrange(dist) %>%
+  pull(prob) %>% first()
+
+cat("Persona 1 — High Risk (top 10%):", round(prob_churn,  4), "\n")
+cat("Persona 2 — Low Risk (bottom 10%):", round(prob_stays,  4), "\n")
+cat("Persona 3 — Borderline:", round(prob_border, 4), "\n")
+
+# ── 3. Compute break-down ─────────────────────────────────────────────────────
+
+bd_churn  <- predict_parts(explainer_rf, persona_churn,  type = "break_down")
+bd_stays  <- predict_parts(explainer_rf, persona_stays,  type = "break_down")
+bd_border <- predict_parts(explainer_rf, persona_border, type = "break_down")
+
+# ── 4. Un-log personas for readable display ───────────────────────────────────
+
+log_cols_present <- names(persona_churn) %>% keep(~ startsWith(., "log_"))
+raw_counterparts <- str_remove(log_cols_present, "^log_")
+
+unlog_persona <- function(persona_df) {
+  persona_df %>%
+    select(-any_of(raw_counterparts)) %>%
+    mutate(across(all_of(log_cols_present), ~ expm1(.))) %>%
+    rename_with(~ str_remove(., "^log_"), all_of(log_cols_present))
+}
+
+persona_churn_unlog  <- unlog_persona(persona_churn)
+persona_stays_unlog  <- unlog_persona(persona_stays)
+persona_border_unlog <- unlog_persona(persona_border)
+
+# ── 5. Custom waterfall plot with un-logged values ────────────────────────────
+
+plot_waterfall <- function(bd_obj, unlogged_persona, title, predicted_prob) {
+  unlogged_df <- as.data.frame(unlogged_persona)
+
+  bd_df <- as.data.frame(bd_obj) %>%
+    filter(!variable_name %in% c("intercept", "")) %>%
+    filter(!grepl("prediction|intercept", variable)) %>%
+    slice_head(n = 10) %>%
+    arrange(contribution)
+
+  display_labels <- vector("character", nrow(bd_df))
+  for (i in seq_len(nrow(bd_df))) {
+    v_clean <- str_remove(bd_df$variable_name[i], "^log_")
+    if (!is.na(v_clean) && v_clean %in% names(unlogged_df)) {
+      val <- round(as.numeric(unlogged_df[[v_clean]]), 2)
+      display_labels[i] <- paste0(v_clean, " = ", val)
+    } else {
+      display_labels[i] <- as.character(bd_df$variable_value[i])
+    }
+  }
+
+  bd_df <- bd_df %>%
+    mutate(
+      display_value = display_labels,
+      direction     = ifelse(contribution > 0, "Increases Risk", "Decreases Risk")
+    )
+
+  # Dynamically extend x-axis to fit labels
+  x_max <- max(bd_df$contribution, na.rm = TRUE) * 1.35
+  x_min <- min(bd_df$contribution, na.rm = TRUE) * 1.35
+
+  bd_df %>%
+    ggplot(aes(reorder(display_value, contribution), contribution,
+               fill = direction)) +
+    geom_col() +
+    geom_text(aes(
+      label = round(contribution, 3),
+      hjust = ifelse(contribution >= 0, -0.15, 1.15)
+    ), size = 3) +
+    coord_flip(clip = "off") +
+    scale_y_continuous(
+      limits = c(min(x_min, -0.005), x_max),
+      expand = expansion(mult = c(0.05, 0.2))
+    ) +
+    scale_fill_manual(values = c(
+      "Increases Risk" = "#d73027",
+      "Decreases Risk" = "#4575b4"
+    )) +
+    labs(
+      title    = title,
+      subtitle = paste0("Predicted churn probability: ", round(predicted_prob, 3)),
+      x        = NULL,
+      y        = "Contribution to predicted probability",
+      fill     = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title      = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle   = element_text(hjust = 0.5, size = 9)
+    )
+}
+
+# ── 6. Plot all three personas ────────────────────────────────────────────────
+
+print(plot_waterfall(bd_churn,  persona_churn_unlog,
+                     "Persona 1: Typical Churner",     prob_churn))
+
+print(plot_waterfall(bd_stays,  persona_stays_unlog,
+                     "Persona 2: Typical Non-Churner", prob_stays))
+
+print(plot_waterfall(bd_border, persona_border_unlog,
+                     "Persona 3: Borderline",          prob_border))
+
+# Check all factor level mappings ─────────────────────────────────────────────
+
+train_data %>%
+  summarise(across(
+    c(call_issue_rate, monthly_minutes, active_subs, current_equipment_days, monthly_revenue, inbound_calls, outbound_calls, equipment_age_relative_to_tenure, dropped_calls, overage_minutes, age_hh1, overage_rate),
+    list(
+      min    = ~ min(., na.rm = TRUE),
+      median = ~ median(., na.rm = TRUE),
+      max    = ~ max(., na.rm = TRUE),
+      mean   = ~ round(mean(., na.rm = TRUE), 2)
+    )
+  )) %>%
+  pivot_longer(everything(),
+               names_to  = c("variable", "stat"),
+               names_sep = "_(?=[^_]+$)") %>%
+  pivot_wider(names_from = stat, values_from = value)
+```
+
+# 12. Evaluation Scoring, Decision Optimisation and Stochastic Risk Analysis
+
+## 12.1 Discount-Offer Threshold Optimisation
+```{r}
+# Step 1: Predicted churn probability + annual revenue for each eval customer.
+
+eval_probs <- predict(rf_model_boruta, eval_model, type = "prob")[, "Yes"]
+max(eval_probs)
+
+cat("nrow(eval_model):", nrow(eval_model), "\n")
+cat("length(eval_probs):", length(eval_probs), "\n")
+
+stopifnot(length(eval_probs) == nrow(eval_data))
+
+eval_R <- 12 * eval_data$monthly_revenue   # predicted annual revenue R_i
+stopifnot(length(eval_R) == length(eval_probs)) 
+
+# Step 2: Algebraic break-even threshold (derived above).
+breakeven_threshold <- 0.05 / 0.14
+cat("Algebraic break-even threshold:", round(breakeven_threshold, 4), "\n")
+
+# Step 3: Expected profit under each action, as functions of p and R.
+expected_profit_no_offer <- function(p, R) (1 - p) * 0.15 * R
+expected_profit_offer    <- function(p, R) (1 - 0.1 * p) * 0.10 * R
+
+# Step 4: Sweep thresholds 0→1. At each t, offer to customers with p_i >= t;
+# sum total portfolio profit under that rule.
+thresholds_seq <- seq(0, 1, by = 0.001)
+
+profit_sensitivity <- map_dfr(thresholds_seq, function(t) {
+  offer_flag <- eval_probs >= t
+  total_profit <- sum(ifelse(
+    offer_flag,
+    expected_profit_offer(eval_probs, eval_R),
+    expected_profit_no_offer(eval_probs, eval_R)
+  ))
+  tibble(threshold = t, n_offered = sum(offer_flag), total_profit = total_profit)
+})
+
+# Baseline = profit if NO customer is offered anything (t = Inf, effectively).
+baseline_profit <- sum(expected_profit_no_offer(eval_probs, eval_R))
+
+profit_sensitivity <- profit_sensitivity %>%
+  mutate(profit_uplift = total_profit - baseline_profit)
+
+# Step 5: Find the empirically profit-maximising threshold.
+optimal_row <- profit_sensitivity %>%
+  filter(total_profit == max(total_profit)) %>%
+  slice(1)
+
+cat("Empirically optimal threshold:", optimal_row$threshold, "\n")
+cat("Customers offered at optimum:", optimal_row$n_offered, "\n")
+cat("Profit uplift vs. no action:", round(optimal_row$profit_uplift, 2), "\n")
+
+# Step 6: Sensitivity chart — required deliverable for this section.
+ggplot(profit_sensitivity, aes(x = threshold, y = profit_uplift)) +
+  geom_line(colour = "#003087", linewidth = 1) +
+  geom_vline(xintercept = breakeven_threshold,
+             linetype = "dashed", colour = "#CC8800", linewidth = 0.8) +
+  geom_vline(xintercept = optimal_row$threshold,
+             linetype = "dotted", colour = "#003087", linewidth = 0.8) +
+  annotate("text",
+           x     = breakeven_threshold + 0.01,
+           y     = max(profit_sensitivity$profit_uplift) * 0.95,
+           label = paste0("Break-even\n", round(breakeven_threshold, 3)),
+           colour = "#CC8800", size = 3, hjust = 0) +
+  annotate("text",
+           x     = optimal_row$threshold + 0.01,
+           y     = max(profit_sensitivity$profit_uplift) * 0.85,
+           label = paste0("Optimum\n", optimal_row$threshold),
+           colour = "#003087", size = 3, hjust = 0) +
+  labs(
+    title    = "Portfolio Profit Uplift by Discount-Offer Threshold (RF Boruta)",
+    subtitle = paste0("Break-even = ", round(breakeven_threshold, 3),
+                      " | Empirical optimum = ", optimal_row$threshold),
+    x        = "Churn probability threshold (offer if p ≥ threshold)",
+    y        = "Expected profit uplift vs. no action ($)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 9, colour = "grey50"),
+    axis.title    = element_text(size = 9),
+    axis.text     = element_text(size = 8)
+  )
+
+# Step 7: Check whether the 3,000-customer operational cap binds.
+
+n_at_breakeven <- sum(eval_probs >= breakeven_threshold)
+cat("Customers exceeding break-even threshold:", n_at_breakeven, "\n")
+
+# ── Trade-off visualization: cumulative profit by number of customers contacted ──
+
+# Step 1: Rank all 10,000 eval customers by per-customer profit uplift, descending.
+uplift_per_customer <- expected_profit_offer(eval_probs, eval_R) -
+                        expected_profit_no_offer(eval_probs, eval_R)
+
+ranked_customers <- tibble(
+  rank   = seq_along(eval_probs),
+  uplift = sort(uplift_per_customer, decreasing = TRUE)
+) %>%
+  mutate(cumulative_uplift = cumsum(uplift))
+
+# Step 2: Identify the two reference points for the chart.
+n_operational_cap <- 3000
+n_profit_maximizing <- which.max(ranked_customers$cumulative_uplift)
+
+profit_at_cap    <- ranked_customers$cumulative_uplift[n_operational_cap]
+profit_at_optimum <- ranked_customers$cumulative_uplift[n_profit_maximizing]
+
+cat("Profit-maximising n:", n_profit_maximizing,
+    "| Cumulative uplift:", round(profit_at_optimum, 2), "\n")
+cat("At operational cap (n=3000) | Cumulative uplift:", round(profit_at_cap, 2), "\n")
+cat("Profit foregone by capping at 3,000:", round(profit_at_optimum - profit_at_cap, 2), "\n")
+
+# Step 3: Plot.
+ggplot(ranked_customers, aes(x = rank, y = cumulative_uplift)) +
+  geom_line(colour = "steelblue", lwd = 1) +
+  geom_vline(xintercept = n_operational_cap, linetype = "dashed", colour = "firebrick") +
+  geom_vline(xintercept = n_profit_maximizing, linetype = "dotted", colour = "darkgreen") +
+  annotate("text", x = n_operational_cap, y = min(ranked_customers$cumulative_uplift),
+           label = paste0("Operational cap\n(n=", n_operational_cap, ")"),
+           colour = "firebrick", vjust = 0, hjust = -0.05, size = 3.2) +
+  annotate("text", x = n_profit_maximizing, y = max(ranked_customers$cumulative_uplift),
+           label = paste0("Profit-maximising\n(n=", n_profit_maximizing, ")"),
+           colour = "darkgreen", vjust = 1, hjust = 1.05, size = 3.2) +
+  labs(
+    title = "Cumulative Profit Uplift vs. Number of Customers Contacted (RF Boruta)",
+    subtitle = "Customers ranked by individual profit uplift, highest first",
+    x = "Number of customers contacted (ranked by profit uplift)",
+    y = "Cumulative expected profit uplift ($)"
+  ) +
+  theme_minimal()
+```
+
+## 12.2 Evaluation Selection and Submission (Top 3,000 by Predicted Risk)
+
+```{r}
+# Step 1: Identify the 3,000 highest-risk customers
+top3000 <- tibble(
+  customer_id = eval_customer_id,
+  p           = eval_probs,
+  R           = eval_R
+) %>%
+  arrange(desc(p)) %>%
+  slice_head(n = 3000)
+
+# Step 2: Apply your final decision threshold (break-even = 0.05/0.14) to
+# determine which of these 3,000 customers actually receive the discount
+# offer under your recommended rule. 
+breakeven_threshold <- 0.05 / 0.14
+
+top3000 <- top3000 %>%
+  mutate(
+    offered = p >= breakeven_threshold,
+    # Effective churn probability under the chosen action:
+    # offer -> churn prob multiplied by 0.1 (90% reduction, per the brief)
+    # no offer -> churn prob unchanged
+    p_effective = ifelse(offered, p * 0.1, p),
+    # Profit if the customer stays, under the chosen action
+    profit_if_stays = ifelse(offered, 0.10 * R, 0.15 * R)
+  )
+
+cat("Customers offered discount in this population:", sum(top3000$offered), "\n")
+cat("Customers not offered (below break-even):", sum(!top3000$offered), "\n")
+
+# ── Write submission CSV ───────────────────────────────────────────────────────
+
+top3000 %>%
+  select(customer_id) %>%
+  write_csv("selected_customers_z5516343.csv")
+
+cat("CSV written with", nrow(top3000), "customers\n")
+```
+
+## 12.3 Stochastic Risk Analysis — Monte Carlo Simulation
+
+Monte Carlo simulation on the top 3,000 highest-risk eval customers (scored by RF Boruta), under the recommended retention-action rule from Section 12.1.
+
+```{r}
+set.seed(31)
+
+n_customers <- nrow(top3000)
+p_vec <- top3000$p_effective
+R_vec <- top3000$R
+profit_stay_vec <- top3000$profit_if_stays
+
+# ── Convergence check: run at increasing simulation sizes to confirm the
+# estimates stabilise, and report the number of runs used to justify it ────
+convergence_check <- function(nsim) {
+  set.seed(31)
+  churn_draws <- matrix(
+    rbinom(nsim * n_customers, size = 1, prob = rep(p_vec, each = nsim)),
+    nrow = nsim, ncol = n_customers
+  )
+  total_churns <- rowSums(churn_draws)
+  # Profit per sim: 0 if churned, profit_if_stays otherwise
+  profit_matrix <- sweep(1 - churn_draws, 2, profit_stay_vec, `*`)
+  total_profit <- rowSums(profit_matrix)
+
+  tibble(
+    nsim = nsim,
+    p95_churns = quantile(total_churns, 0.95),
+    p5_profit  = quantile(total_profit, 0.05)
+  )
+}
+
+convergence_results <- map_dfr(c(100, 250, 500, 2000, 5000, 10000, 20000), convergence_check)
+convergence_results %>% kable() %>% print()
+
+n_sim <- 10000
+
+# ── Final simulation at chosen n_sim ─────────────────────────────────────────
+set.seed(31)
+churn_draws <- matrix(
+  rbinom(n_sim * n_customers, size = 1, prob = rep(p_vec, each = n_sim)),
+  nrow = n_sim, ncol = n_customers
+)
+
+total_churns_sim <- rowSums(churn_draws)
+profit_matrix    <- sweep(1 - churn_draws, 2, profit_stay_vec, `*`)
+total_profit_sim <- rowSums(profit_matrix)
+
+# ── Required outputs ──────────────────────────────────────────────────────────
+p95_total_churns <- quantile(total_churns_sim, 0.95)
+p5_total_profit  <- quantile(total_profit_sim, 0.05)
+
+cat("\n══ Stochastic Risk Analysis Results (n_sim =", n_sim, ") ══\n")
+cat("Mean total churns across simulations:", round(mean(total_churns_sim), 1), "\n")
+cat("95th percentile (1-in-20 worst-case) total churns:", round(p95_total_churns, 0), "\n")
+cat("Mean total profit across simulations: $", round(mean(total_profit_sim), 2), "\n")
+cat("5th percentile (1-in-20 worst-case) total profit: $", round(p5_total_profit, 2), "\n")
+
+# ── Visualisation — distribution of both metrics with the percentile marked ──
+p5 <- ggplot(tibble(x = total_churns_sim), aes(x)) +
+  geom_histogram(bins = 50, fill = "#CC8800", alpha = 0.7) +
+  geom_vline(xintercept = p95_total_churns, colour = "firebrick", linetype = "dashed", lwd = 1) +
+  labs(title = "Simulated Total Churns — Top 3,000 Highest-Risk Customers",
+       subtitle = paste0("95th percentile (1-in-20 worst case) = ", round(p95_total_churns, 0)),
+       x = "Total churns", y = "Simulation count") +
+  theme_minimal()
+
+p6 <- ggplot(tibble(x = total_profit_sim), aes(x)) +
+  geom_histogram(bins = 50, fill = "#003087", alpha = 0.7) +
+  geom_vline(xintercept = p5_total_profit, colour = "firebrick", linetype = "dashed", lwd = 1) +
+  labs(title = "Simulated Total Profit — Top 3,000 Highest-Risk Customers",
+       subtitle = paste0("5th percentile (1-in-20 worst case) = $", round(p5_total_profit, 0)),
+       x = "Total profit ($)", y = "Simulation count") +
+  theme_minimal()
+
+print(p5)
+print(p6)
+
+running_convergence <- tibble(
+  n = seq(100, n_sim, by = 150),
+  running_p95 = map_dbl(seq(100, n_sim, by = 150), ~ quantile(total_churns_sim[1:.x], 0.95))
+)
+
+ggplot(running_convergence, aes(x = n, y = running_p95)) +
+  geom_line(colour = "steelblue") +
+  labs(title = "Convergence of 95th-Percentile Churn Estimate",
+       x = "Number of simulation runs", y = "Running 95th percentile (total churns)") +
+  theme_minimal()
+
+
+# Standard error of a quantile estimate via bootstrap — a direct,
+# defensible way to answer "how many runs do I need"
+percentile_se <- function(x, prob, n_boot = 500) {
+  boot_estimates <- replicate(n_boot, quantile(sample(x, replace = TRUE), prob))
+  sd(boot_estimates)
+}
+
+se_p95_churns <- percentile_se(total_churns_sim, 0.95)
+se_p5_profit  <- percentile_se(total_profit_sim, 0.05)
+
+cat("SE of 95th percentile churns:", round(se_p95_churns, 2), "\n")
+cat("SE of 5th percentile profit: $", round(se_p5_profit, 2), "\n")
+```
